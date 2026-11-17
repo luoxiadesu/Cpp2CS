@@ -23,7 +23,9 @@ internal static class MetadataSlotPhisPass
                 if (choices.Any(c => c.Value is null) || choices.SelectMany(c => c.Slots).Select(s => SymbolOfPass.SymbolOf(s.Usage.Kind)).Distinct().Count() != 1)
                     continue;
                 var loads = state.All.SelectMany(ExprMap.Operands).SelectMany(ExprMap.Walk).OfType<Load>().Where(l => l is { Width: 64, Address: Use use } && use.Variable == phi.Target).ToHashSet();
-                var initializers = state.All.OfType<Call>().Where(c => c.Kind == CallKind.Direct && state.owner.HelperOf(c)?.Kind == HelperKind.InitMetadata && c.Arguments is [Use { Variable: var argument }, ..] && argument == phi.Target && c.Defines.Length <= 1).ToHashSet(ReferenceEqualityComparer.Instance);
+                // 初始化调用按用途区间（v24）或槽位地址（v27+）指向 φ 给出的实参。
+                var initializers = state.All.OfType<Call>().Where(c => c.Kind == CallKind.Direct && state.owner.HelperOf(c)?.Kind == HelperKind.InitMetadata
+                    && c.Arguments is [Use { Variable: var argument }, ..] && argument == phi.Target && c.Defines.Length <= 1).ToHashSet(ReferenceEqualityComparer.Instance);
                 if (loads.Count == 0 && initializers.Count == 0)
                     continue;
                 var target = state.Fresh();

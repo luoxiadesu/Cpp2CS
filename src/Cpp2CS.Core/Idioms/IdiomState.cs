@@ -34,6 +34,20 @@ internal sealed class IdiomState(IdiomRewriter owner, MachineFunction function)
     internal void Reject(string rule, ulong address, string reason) => Result.Rejections.Add(new(rule, address, reason));
     internal IEnumerable<Stmt> All => this.function.Blocks.Where(b => !this.removed.Contains(b)).SelectMany(b => b.Statements);
 
+    /// <summary>
+    /// InitMetadata 实参所指的槽位与用途。v24 的实参是元数据用途区间的下标，一次初始化一组槽位；
+    /// 也是槽位地址本身（v27+ 的形态）。实参不是常量、下标越界或目的槽位无法解码时为 null。
+    /// </summary>
+    internal (ulong Slot, Usage Usage)[]? MetadataSlots(Expr argument) =>
+        defs.Expand(argument) is Const constant ? MetadataSlots(constant) : null;
+
+    /// <summary>已代入常量后的 InitMetadata 实参。</summary>
+    internal (ulong Slot, Usage Usage)[]? MetadataSlots(Const constant)
+    {
+        if (facts.Model.UsagesOfList(constant.Value) is { } group) return group;
+        return facts.Usages.At(constant.Value) is { } slot ? [(constant.Value, slot.Usage)] : null;
+    }
+
     /// <summary>块内的一个执行位置：第 Index 条语句之前、地址 Address 的指令之前（传播删去的定义按地址排入）。</summary>
     internal readonly record struct Point(int Index, ulong Address);
 }

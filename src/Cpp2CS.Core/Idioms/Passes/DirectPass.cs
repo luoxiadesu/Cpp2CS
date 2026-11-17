@@ -24,11 +24,15 @@ internal static class DirectPass
             };
         }
 
-        if (helper.Kind == HelperKind.InitMetadata && args.Length > 0 && state.defs.Expand(args[0]) is Const slotAddress && state.facts.Usages.At(slotAddress.Value) is { } slot)
+        // 元数据惰性初始化：v27+ 的实参是槽位地址本身，v24 是用途区间的下标（一次初始化该区间的全部槽位）。
+        // 两种形态都只登记槽位，不生成语句；调用删除后由读取处按槽位符号取值。
+        if (helper.Kind == HelperKind.InitMetadata && args.Length > 0 && state.MetadataSlots(args[0]) is { } slots)
         {
-            state.Result.InitializedSlots.Add(slotAddress.Value);
+            state.Result.InitializedSlots.UnionWith(slots.Select(s => s.Slot));
             state.Result.Hit(Template.LazyMetadataInit);
-            state.lazyValues.Add((call, new Symbol(SymbolOfPass.SymbolOf(slot.Usage.Kind), slot.Usage.Value)));
+            // 只有单槽位的形态能在调用点直接代换成符号：多槽位时没有唯一的替换值，读取处各自按槽位取。
+            if (slots is [var only])
+                state.lazyValues.Add((call, new Symbol(SymbolOfPass.SymbolOf(only.Usage.Kind), only.Usage.Value)));
             return null;
         }
 

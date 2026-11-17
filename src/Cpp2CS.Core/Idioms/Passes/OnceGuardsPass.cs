@@ -248,8 +248,8 @@ internal static class OnceGuardsPass
             {
                 case Kind.Metadata:
                     if (helper != HelperKind.InitMetadata || call.Arguments.FirstOrDefault() is not { } slot || Normal(slot, line, 0) is not Const address
-                        || state.facts.Usages.At(address.Value) is null) return false;
-                    line.Slots.Add(address.Value);
+                        || state.MetadataSlots(address) is not { } group) return false;
+                    line.Slots.AddRange(group.Select(s => s.Slot));
                     return true;
                 case Kind.ClassConstructor:
                     return call.Op is { Kind: OpKind.RunClassConstructor } op ? Equals(op.Operand, guard.Type) : helper == HelperKind.ClassInit && Class(call, line);

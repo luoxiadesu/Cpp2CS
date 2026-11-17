@@ -73,18 +73,27 @@ internal static class IdiomPipeline
 
     internal static void Run(this IdiomState state)
     {
+        var trace = Environment.GetEnvironmentVariable("CPP2CS_PASS_TRACE") == "1";
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        void Mark(string stage) { if (trace) { Console.Error.WriteLine($"idioms {stage} {clock.Elapsed.TotalSeconds:F2}s"); clock.Restart(); } }
         Identify(state);
+        Mark("identify");
         state.Cleanup();
+        Mark("cleanup");
         state.Passes.Run("idioms.CountCalls", () => state.CountCalls());
         state.Passes.Run("idioms.TrimResultBuffers", () => state.TrimResultBuffers());
+        Mark("count/trim");
         ToFixedPoint(state, first: true);
+        Mark("fixed-point 1");
         // 先做完不动点：类初始化的标志位判断要靠支配它的初始化才能折叠。
         if (state.Passes.Run("idioms.class.beforefieldinit", () => ClassInitializationFacts.DropUnconstrained(state.function)))
         {
             state.Cleanup();
             ToFixedPoint(state, first: false);
+            Mark("fixed-point 2");
         }
         state.Passes.Run("idioms.Residuals", () => state.Residuals());
+        Mark("residuals");
     }
 
     private static void ToFixedPoint(IdiomState state, bool first)
@@ -107,23 +116,37 @@ internal static class IdiomPipeline
         var before = state.function.Blocks.SelectMany(b => b.Statements).ToArray();
         var reported = rule.Apply(state);
         var after = state.function.Blocks.SelectMany(b => b.Statements).ToArray();
-        var changed = before.Length != after.Length || !before.Zip(after).All(p => ReferenceEquals(p.First, p.Second) || p.First.ToString() == p.Second.ToString());
+        // 大多数规则不改动；引用相同即未变，只有长度相同且逐条引用不同时才需要按内容比较。
+        var changed = before.Length != after.Length || !SameStatements(before, after);
         var reportedErrors = state.Result.Errors.Count;
         if (changed || reported) state.Cleanup();
         if (state.Result.Errors.Count > reportedErrors) state.Result.Errors[reportedErrors] = $"{rule.Name}：{state.Result.Errors[reportedErrors]}";
         return changed;
     }
 
+    /// <summary>逐条判断语句是否相同：先比引用，不同再按打印形式比较。改写规则的输出按引用替换，内容比较只兜住原地修改。</summary>
+    private static bool SameStatements(Stmt[] before, Stmt[] after)
+    {
+        for (var i = 0; i < before.Length; i++)
+            if (!ReferenceEquals(before[i], after[i]) && before[i].ToString() != after[i].ToString()) return false;
+        return true;
+    }
+
     /// <summary>函数自身的托管身份与隐藏 MethodInfo 的位置；栈上传入的实参改写为入口值。</summary>
     private static void Identify(IdiomState state)
     {
+        var trace = Environment.GetEnvironmentVariable("CPP2CS_PASS_TRACE") == "1";
+        var watch = System.Diagnostics.Stopwatch.StartNew();
         IdentifySelf(state);
+        if (trace) { Console.Error.WriteLine($"identify self {watch.Elapsed.TotalSeconds:F2}s"); watch.Restart(); }
         var signatures = state.facts.EntriesAt(state.function.Entry).Select(e => e.Method).OfType<MethodRef>().Distinct().Select(m => state.owner.abi.Classify(m, out _)).ToArray();
+        if (trace) { Console.Error.WriteLine($"identify classify {watch.Elapsed.TotalSeconds:F2}s"); watch.Restart(); }
         if (signatures.Length == 0 && state.facts.Unregistered.At(state.function.Entry) is { } stackIdentity)
             signatures = [stackIdentity.Abi];
         if (signatures.All(s => s is not null) && StackInputNormalizer.Run(state.function, state.owner.abi, signatures.Select(s => s!).ToArray(), out var hiddenStack)
             && hiddenStack is { } offset)
             state.selfMethodInfo = Storage.Slot(offset);
+        if (trace) Console.Error.WriteLine($"identify stack {watch.Elapsed.TotalSeconds:F2}s");
     }
 
     /// <summary>函数自身的托管身份与隐藏 MethodInfo 所在的寄存器。</summary>
