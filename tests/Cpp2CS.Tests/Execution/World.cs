@@ -448,7 +448,6 @@ internal sealed partial class World
         methodInfoOwners.Add(info, method);
         var code = Index.CodeAddress(method);
         Put64(info + RuntimeLayout.MethodPointer, code);
-        Put64(info + RuntimeLayout.MethodVirtualPointer, code);
         Put64(info + RuntimeLayout.MethodName, CString(method.Method.Name));
         // 调用方几乎不读 MethodInfo 的内容；声明类型合成不了（如未实例化的泛型定义）时 klass 留 0
         try { Put64(info + RuntimeLayout.MethodKlass, Klass(method.DeclaringType)); }

@@ -9,7 +9,7 @@ namespace Cpp2CS.Idioms;
 /// <summary>
 /// MethodInfo.invoker_method 的参数数组拆为独立实参，保留值参数与返回值的存储地址；数组槽的内容由帧内存转发。
 /// 完全共享代码只能经 invoker 调用签名含可变大小值的方法：invoker(指针, MethodInfo, 接收者, 参数数组, 返回存储)。
-/// MethodInfo 可以是元数据实体，也可以是分派查找的结果；后者的指针取 virtualMethodPointer，是一次 callvirt。
+/// 该版本的 MethodInfo 没有 virtualMethodPointer，MethodInfo 只是元数据实体（或约束解析项）。
 /// </summary>
 internal static class InvokerCallsPass
 {
@@ -31,7 +31,6 @@ internal static class InvokerCallsPass
     private static bool Run(MachineFunction function, IdiomRewriter.Defs defs, MethodRef? self, ManagedAbi abi, Func<Call, bool> isConstrained, Func<Call, bool> unnamed,
         Action<string, ulong, string>? reject)
     {
-        Dictionary<Variable, Call>? lookups = null;
         foreach (var block in function.Blocks)
             for (var i = 0; i < block.Statements.Count; i++)
             {
@@ -65,28 +64,18 @@ internal static class InvokerCallsPass
                     && Input(1) == info && Input(2) is { } receiver && Actual(3) is { } arguments && Actual(4) is { } output)
                 {
                     MethodRef? method;
-                    var dispatched = false;
                     if (info is Symbol { Kind: SymbolKind.Method, Value: MethodRef direct })
                     {
                         if (Input(0) != new Load(info, 64)) continue;
                         method = direct;
                     }
-                    else
-                    {
-                        if (Input(0) != new Load(Offset(info, RuntimeLayout.MethodVirtualPointer), 64)) continue;
-                        lookups ??= function.Blocks.SelectMany(b => b.Statements).OfType<Call>()
-                            .Where(c => c.Op?.Kind is OpKind.InterfaceInvokeData or OpKind.ResolveGenericVirtual && c.Defines.Length > 0 && c.Defines[0] is not null)
-                            .ToDictionary(c => c.Defines[0]);
-                        method = Dispatched(info, receiver, defs, lookups);
-                        dispatched = true;
-                        if (method is null) continue;
-                    }
+                    else continue;
                     if (Unsized(abi.Invoker(self is not null ? (MethodRef)GenericContext.Instantiate(method, self)! : method)))
                     {
                         reject?.Invoke("invoker.signature", call.Address, "按址实参的大小未知");
                         continue;
                     }
-                    replacement = Unpacked(call, new(dispatched ? OpKind.InvokeVirtualGeneric : OpKind.InvokeGeneric, method), method, Actual(2)!, arguments, output);
+                    replacement = Unpacked(call, new(OpKind.InvokeGeneric, method), method, Actual(2)!, arguments, output);
                 }
                 if (replacement is null) continue;
                 var statements = new List<Stmt> { replacement };
@@ -133,23 +122,6 @@ internal static class InvokerCallsPass
             Defines = [],
             StackPointer = null,
         };
-    }
-
-    /// <summary>
-    /// 分派查找得到的方法：接口槽 VirtualInvokeData.method，或泛型虚方法的解析结果（其声明槽来自接口查找或接收者类的虚表）。
-    /// 查找的对象必须就是接收者：invoker 不重新分派，接收者换了对象就不是这次查找的方法。
-    /// </summary>
-    private static MethodRef? Dispatched(Expr info, Expr receiver, IdiomRewriter.Defs defs, Dictionary<Variable, Call> lookups)
-    {
-        Call? InterfaceLookup(Expr slot) => slot is Load { Width: 64 } load && SplitPass.Split(load.Address) is (Use data, RuntimeLayout.VirtualInvokeDataMethod)
-            && lookups.TryGetValue(data.Variable, out var lookup) && lookup.Op!.Kind == OpKind.InterfaceInvokeData && defs.Expand(lookup.Arguments[0]) == receiver ? lookup : null;
-        if (InterfaceLookup(info) is { Op.Operand: ValueTuple<object?, int> { Item1: DefinitionRef owner } operand })
-            return DispatchResolution.Slot(owner, operand.Item2, interfaceOnly: true);
-        if (info is not Use resolved || !lookups.TryGetValue(resolved.Variable, out var generic)
-            || generic.Op is not { Kind: OpKind.ResolveGenericVirtual, Operand: MethodRef method }) return null;
-        var declared = defs.Expand(generic.Arguments[0]);
-        var fromVtable = declared is Load { Width: 64 } entry && SplitPass.Split(entry.Address) is (Load { Width: 64, Address: var klassOwner }, _) && klassOwner == receiver;
-        return fromVtable || InterfaceLookup(declared) is not null ? method : null;
     }
 
     private static Expr Offset(Expr value, int offset) => offset == 0 ? value : Fold.Simplify(new Binary(BinOp.Add, value, Expr.C((ulong)offset, 64), 64));

@@ -52,16 +52,25 @@ public static class ExceptionTable
             var offset = ReadUleb();
             typeEnd = checked(cursor + offset);
         }
-        if (ReadByte() != 1) throw new NotSupportedException("尚未支持非 ULEB128 call-site table");
+        // call-site 编码：clang 对 Android 通常写 0x01（ULEB128），本样本为 0x03（udata4）。
+        var callSiteEncoding = ReadByte();
+        ulong ReadCallSite()
+        {
+            if (callSiteEncoding == 1) return ReadUleb();
+            if (callSiteEncoding == 3) { var value = image.ReadU32(cursor); cursor += 4; return value; }
+            throw new NotSupportedException($"尚未支持 call-site 编码 0x{callSiteEncoding:x}");
+        }
+        // call-site 表长度始终是 ULEB128；表内 start/length/landing 用 call-site 编码（本样本为 0x03 udata4）。
         var length = ReadUleb();
         if (length > 65536) throw new InvalidDataException("LSDA call-site table 超出限制");
         var end = checked(cursor + length);
         var regions = new List<ExceptionRegion>();
         while (cursor < end)
         {
-            var start = checked(functionStart + ReadUleb());
-            var limit = checked(start + ReadUleb());
-            var landing = ReadUleb();
+            var start = checked(functionStart + ReadCallSite());
+            var limit = checked(start + ReadCallSite());
+            var landing = ReadCallSite();
+            // action 是动作表的 ULEB128 偏移，与 call-site 字段编码无关（Itanium C++ ABI 的 LSDA 布局）。
             var action = ReadUleb();
             if (start < functionStart || limit > functionEnd || limit < start ||
                 (landing != 0 && checked(functionStart + landing) >= functionEnd) ||

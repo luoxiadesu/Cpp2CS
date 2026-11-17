@@ -16,6 +16,9 @@ internal sealed class NativeCalleeFacts(ProgramFacts facts, bool recoverUnusedIn
     {
         if (!unusedResultBuffers.TryGetValue(entry, out var unused))
         {
+            // 不是函数入口（函数内的局部标号）时没有可证结论，按“使用结果缓冲”处理。
+            if (facts.Code.At(entry) is not { } function || function.Start != entry)
+                return unused = false;
             var convention = inputLifter.Machine.Convention;
             // 未知签名保留全部可能的返回寄存器，x8 只承担间接返回地址，不是托管参数寄存器。
             var returned = convention.IntegerResults.Concat(convention.FloatResults)
@@ -35,7 +38,8 @@ internal sealed class NativeCalleeFacts(ProgramFacts facts, bool recoverUnusedIn
             nativeInputs.Add(entry, null);
             var methods = facts.EntriesAt(entry).Select(e => e.Method).OfType<MethodRef>().ToArray();
             reads = null;
-            if (methods.Length > 0 && methods.All(m => (m.Method.Address == entry || m.Method.Address == 0)
+            if (methods.Length > 0 && facts.Code.At(entry) is { } callee && callee.Start == entry
+                && methods.All(m => (m.Method.Address == entry || m.Method.Address == 0)
                 && !m.TypeArguments.Concat(m.MethodArguments).Any(FieldLayouts.IsFullyShared)))
             {
                 var signatures = methods.Select(m => abi.Classify(m, out _)).ToArray();

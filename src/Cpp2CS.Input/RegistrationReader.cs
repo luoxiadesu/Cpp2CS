@@ -10,25 +10,22 @@ using Cpp2CS.Model;
 namespace Cpp2CS.Input
 {
     /// <summary>
-    /// 按 Unity 2022.3.62f2 libil2cpp 头文件（il2cpp-class-internals.h / il2cpp-metadata.h）的精确布局，
+    /// 按 Unity 2018.4.19f1 libil2cpp（元数据 v24.1）的运行时布局，
     /// 直接从映像读取 CodeRegistration / MetadataRegistration 中的代码入口表。
-    /// 偏移由 gcc 对 Il2CppVersions/headers/2022.3.62f2.h 计算（LP64，与 AArch64 一致）。
+    /// 该版本的 CodeRegistration 以全局 methodPointers 表开头，没有 CodeGenModule；RGCTX 来自元数据 rgctxEntries。
     /// 指针一律经 <see cref="ImageDocument.ReadPointer"/> 读取，以应用 RELATIVE 重定位。
     /// </summary>
     public sealed class RegistrationReader
     {
-        // Il2CppCodeRegistration
-        private const int CrReversePInvokeCount = 0, CrReversePInvoke = 8, CrGenericMethodCount = 16, CrGenericMethods = 24,
-            CrGenericAdjustors = 32, CrInvokerCount = 40, CrInvokers = 48, CrUnresolvedCount = 56, CrUnresolvedVirtual = 64,
-            CrUnresolvedInstance = 72, CrUnresolvedStatic = 80, CrInteropCount = 88, CrInterop = 96, CrModuleCount = 120, CrModules = 128;
-        // Il2CppCodeGenModule
-        private const int CmName = 0, CmMethodCount = 8, CmMethods = 16, CmAdjustorCount = 24, CmAdjustors = 32, CmInvokerIndices = 40,
-            CmReversePInvokeCount = 48, CmReversePInvokeIndices = 56, CmRgctxRangeCount = 64, CmRgctxRanges = 72, CmRgctxCount = 80,
-            CmRgctxs = 88, CmModuleInitializer = 104;
-        // Il2CppMetadataRegistration
+        // Il2CppCodeRegistration：methodPointers, reversePInvoke, genericMethodPointers, invokerPointers,
+        // customAttributeGenerators, unresolvedVirtualCallPointers, interopData（均为 count/pointer 对）
+        private const int CrMethodCount = 0, CrMethods = 8, CrReversePInvokeCount = 16, CrReversePInvoke = 24,
+            CrGenericMethodCount = 32, CrGenericMethods = 40, CrInvokerCount = 48, CrInvokers = 56,
+            CrUnresolvedCount = 80, CrUnresolvedVirtual = 88, CrInteropCount = 96, CrInterop = 104;
+        // Il2CppMetadataRegistration：genericClasses, genericInsts, genericMethodTable, types, methodSpecs, fieldOffsets, typeDefinitionsSizes, metadataUsages
         private const int MrGenericMethodTableCount = 32, MrGenericMethodTable = 40, MrTypesCount = 48, MrTypes = 56,
             MrUsagesCount = 112, MrUsages = 120;
-        private const int InteropSize = 56, AdjustorPairSize = 16, TokenIndexTupleSize = 24, RgctxSize = 16, TokenRangeSize = 12, GenericMethodTableSize = 16;
+        private const int InteropSize = 56, GenericMethodTableSize = 12;
 
         private readonly ImageDocument image;
         private readonly ProgramModel model;
@@ -76,54 +73,25 @@ namespace Cpp2CS.Input
             var typeIndex = new Dictionary<ulong, int>(typePointers.Length);
             for (var i = 0; i < typePointers.Length; i++) typeIndex.TryAdd(typePointers[i], i);
 
-            // 非泛型方法、this 调整桩、反向 P/Invoke、模块初始化、RGCTX：逐个 CodeGenModule
-            var byImage = model.Assemblies.ToDictionary(a => a.Name, a => a.Types.SelectMany(t => t.Methods).ToDictionary(m => m.Token));
+            // 非泛型方法的全局入口表：方法定义的 methodIndex 给出表内序号。
+            var methods = Pointers(Pointer(code + CrMethods), (long)image.ReadU64(code + CrMethodCount));
             var invokerOf = new Dictionary<MethodDef, int>();
-            var rgctx = new Dictionary<(string, uint), RgctxEntry[]>();
-            var reverseWrappers = Pointers(Pointer(code + CrReversePInvoke), U32(code + CrReversePInvokeCount));
-            var modules = Pointers(Pointer(code + CrModules), U32(code + CrModuleCount));
-            foreach (var module in modules)
+            foreach (var method in model.Methods)
             {
-                var name = ReadCString(Pointer(module + CmName));
-                if (!byImage.TryGetValue(name, out var tokens)) throw new InvalidDataException($"CodeGenModule {name} 没有对应的程序集");
-                var methodCount = U32(module + CmMethodCount);
-                var methods = Pointers(Pointer(module + CmMethods), methodCount);
-                var invokerIndices = Pointer(module + CmInvokerIndices);
-                for (var rid = 1u; rid <= methodCount; rid++)
-                {
-                    var token = 0x06000000u | rid;
-                    if (!tokens.TryGetValue(token, out var method)) { if (methods[rid - 1] != 0) problems.Add($"{name} 方法令牌 0x{token:x8} 有代码但没有定义"); continue; }
-                    Add(methods[rid - 1], EntryKind.Method, new MethodRef(method, [], []), (int)rid - 1, name);
-                    if (invokerIndices != 0) invokerOf[method] = I32(invokerIndices + (rid - 1) * 4);
-                    if (method.Address != methods[rid - 1]) problems.Add($"{method} 的 Address 0x{method.Address:x} 与 methodPointers 0x{methods[rid - 1]:x} 不一致");
-                }
-                var adjustors = Pointer(module + CmAdjustors);
-                for (var i = 0u; i < U32(module + CmAdjustorCount); i++)
-                {
-                    var pair = adjustors + i * AdjustorPairSize;
-                    var token = U32(pair);
-                    if (!tokens.TryGetValue(token, out var method)) { problems.Add($"{name} adjustor 令牌 0x{token:x8} 没有定义"); continue; }
-                    Add(Pointer(pair + 8), EntryKind.AdjustorThunk, new MethodRef(method, [], []), (int)i, name);
-                }
-                var tuples = Pointer(module + CmReversePInvokeIndices);
-                for (var i = 0u; i < U32(module + CmReversePInvokeCount); i++)
-                {
-                    var tuple = tuples + i * TokenIndexTupleSize;
-                    var token = U32(tuple);
-                    var index = I32(tuple + 4);
-                    var generic = I32(tuple + 16);
-                    MethodRef? method = generic >= 0 && generic < model.MethodSpecs.Count ? model.MethodSpecs[generic]
-                        : tokens.TryGetValue(token, out var def) ? new MethodRef(def, [], []) : null;
-                    if (index < 0 || index >= reverseWrappers.Length) { problems.Add($"{name} 反向 P/Invoke 序号越界 {index}"); continue; }
-                    Add(reverseWrappers[index], EntryKind.ReversePInvoke, method, index, name);
-                }
-                Add(Pointer(module + CmModuleInitializer), EntryKind.ModuleInitializer, null, 0, name);
-                ReadRgctx(name, module, rgctx);
+                var index = method.MethodIndex;
+                if (index < 0) continue;
+                if (index >= methods.Length) { problems.Add($"{method} 的 methodIndex {index} 超出全局方法表 {methods.Length}"); continue; }
+                Add(methods[index], EntryKind.Method, new MethodRef(method, [], []), index, method.Owner.Assembly);
+                if (method.InvokerIndex >= 0) invokerOf[method] = method.InvokerIndex;
+                if (method.Address != methods[index]) problems.Add($"{method} 的 Address 0x{method.Address:x} 与 methodPointers 0x{methods[index]:x} 不一致");
             }
 
-            // 泛型方法实例与泛型 this 调整桩：genericMethodTable[i] = { methodSpec, { methodIndex, invokerIndex, adjustorThunkIndex } }
-            var genericPointers = Pointers(Pointer(code + CrGenericMethods), U32(code + CrGenericMethodCount));
-            var genericAdjustors = Pointer(code + CrGenericAdjustors);
+            // 反向 P/Invoke 包装：count 后紧跟指针数组。
+            var reverseWrappers = Pointers(Pointer(code + CrReversePInvoke), (long)image.ReadU64(code + CrReversePInvokeCount));
+            for (var i = 0; i < reverseWrappers.Length; i++) Add(reverseWrappers[i], EntryKind.ReversePInvoke, null, i, null);
+
+            // 泛型方法实例：genericMethodTable[i] = { methodSpec, { methodIndex, invokerIndex } }；该版本没有 adjustorThunk。
+            var genericPointers = Pointers(Pointer(code + CrGenericMethods), (long)image.ReadU64(code + CrGenericMethodCount));
             var table = Pointer(meta + MrGenericMethodTable);
             var tableCount = I32(meta + MrGenericMethodTableCount);
             for (var i = 0; i < tableCount; i++)
@@ -131,39 +99,58 @@ namespace Cpp2CS.Input
                 var row = table + (ulong)i * GenericMethodTableSize;
                 var spec = I32(row);
                 var methodIndex = I32(row + 4);
-                var adjustorIndex = I32(row + 12);
                 if (spec < 0 || spec >= model.MethodSpecs.Count || methodIndex < 0 || methodIndex >= genericPointers.Length)
                 { problems.Add($"genericMethodTable[{i}] 序号越界：spec {spec}, method {methodIndex}"); continue; }
                 Add(genericPointers[methodIndex], EntryKind.GenericMethod, model.MethodSpecs[spec], methodIndex, null);
-                if (adjustorIndex >= 0 && genericAdjustors != 0)
-                    Add(Pointer(genericAdjustors + (ulong)adjustorIndex * 8), EntryKind.GenericAdjustorThunk, model.MethodSpecs[spec], adjustorIndex, null);
             }
 
-            var invokers = Pointers(Pointer(code + CrInvokers), U32(code + CrInvokerCount));
+            var invokers = Pointers(Pointer(code + CrInvokers), (long)image.ReadU64(code + CrInvokerCount));
             for (var i = 0; i < invokers.Length; i++) Add(invokers[i], EntryKind.Invoker, null, i, null);
-            var unresolved = U32(code + CrUnresolvedCount);
-            foreach (var (offset, kind) in new[] { (CrUnresolvedVirtual, EntryKind.UnresolvedVirtualCall), (CrUnresolvedInstance, EntryKind.UnresolvedInstanceCall), (CrUnresolvedStatic, EntryKind.UnresolvedStaticCall) })
-            {
-                var array = Pointer(code + (ulong)offset);
-                if (array == 0) continue;
-                var pointers = Pointers(array, unresolved);
-                for (var i = 0; i < pointers.Length; i++) Add(pointers[i], kind, null, i, null);
-            }
+            var unresolved = (long)image.ReadU64(code + CrUnresolvedCount);
+            var unresolvedPointers = Pointers(Pointer(code + CrUnresolvedVirtual), unresolved);
+            for (var i = 0; i < unresolvedPointers.Length; i++) Add(unresolvedPointers[i], EntryKind.UnresolvedVirtualCall, null, i, null);
+
+            // 互操作数据：Il2CppInteropData 为 7 个指针
+            // { delegatePInvokeWrapper, marshalToNative, marshalFromNative, marshalCleanup, createCCW, guid, type }。
+            // 按 56 字节步长读取时，469 项的类型指针全部落在 types 表中。
             var interop = Pointer(code + CrInterop);
-            for (var i = 0u; i < U32(code + CrInteropCount); i++)
+            var interopCount = (long)image.ReadU64(code + CrInteropCount);
+            var interopKinds = new[]
             {
-                var row = interop + i * InteropSize;
+                EntryKind.DelegatePInvokeWrapper, EntryKind.MarshalToNative, EntryKind.MarshalFromNative,
+                EntryKind.MarshalCleanup, EntryKind.CreateCcw,
+            };
+            for (var i = 0; i < interopCount; i++)
+            {
+                var row = interop + (ulong)i * InteropSize;
                 var type = Pointer(row + 48);
                 var detail = typeIndex.TryGetValue(type, out var t) ? model.RuntimeTypes[t].ToString() : $"type@0x{type:x}";
-                Add(Pointer(row), EntryKind.DelegatePInvokeWrapper, null, (int)i, detail);
-                Add(Pointer(row + 8), EntryKind.MarshalToNative, null, (int)i, detail);
-                Add(Pointer(row + 16), EntryKind.MarshalFromNative, null, (int)i, detail);
-                Add(Pointer(row + 24), EntryKind.MarshalCleanup, null, (int)i, detail);
-                Add(Pointer(row + 32), EntryKind.CreateCcw, null, (int)i, detail);
+                for (var k = 0; k < interopKinds.Length; k++)
+                    Add(Pointer(row + (ulong)k * 8), interopKinds[k], null, (int)i, detail);
             }
 
-            var usageCount = image.ReadU64(meta + MrUsagesCount);
+            var rgctx = ReadRgctx();
+            // v24：槽位表长度以元数据用途表的最大 destinationIndex+1 为准。注册表里的 metadataUsagesCount
+            // 可能小于实际长度（该样本为 74485，而序号最大到 76685），按它读取会截断尾部槽位。
+            // Il2CppDumper 同样以元数据表算出的数量读取这张表。
+            var listed = image.ReadU64(meta + MrUsagesCount);
+            var usageCount = listed;
+            if (model.MetadataUsagePairs.Count > 0)
+                usageCount = Math.Max(listed, model.MetadataUsagePairs.Max(p => (ulong)p.Destination) + 1);
             var usages = usageCount == 0 ? Array.Empty<ulong>() : Pointers(Pointer(meta + MrUsages), (long)usageCount);
+            // 槽位在 .bss、初值为 0，不能用 v27+ 的初值解码，这里按地址直接建立映射。
+            if (model.MetadataVersion <= 24.1 && model.MetadataUsagePairs.Count > 0)
+            {
+                var bySlot = new Dictionary<ulong, Usage>();
+                foreach (var (destination, kind, index) in model.MetadataUsagePairs)
+                {
+                    if (destination >= usages.Length) { problems.Add($"元数据用途序号 {destination} 超出槽位表 {usages.Length}"); continue; }
+                    if (model.DecodeToken(kind, index) is not { } usage) { problems.Add($"元数据用途 ({kind}, {index}) 无法解码"); continue; }
+                    bySlot[usages[destination]] = usage;
+                }
+                model.MetadataUsages = bySlot;
+                model.UsageSlotAddresses = usages;
+            }
 
             return new Registrations
             {
@@ -179,67 +166,46 @@ namespace Cpp2CS.Input
         }
 
         /// <summary>
-        /// v27.2+：Il2CppRGCTXDefinition { type; const void* data }，data 指向只读区中的定义数据：
-        /// TYPE/CLASS/ARRAY 为 int32 类型表序号，METHOD 为 int32 methodSpec 序号，
-        /// CONSTRAINED 为 Il2CppRGCTXConstrainedData { int32 typeIndex; uint32 encodedMethodIndex }。
+        /// v24.1：元数据 rgctxEntries 是 Il2CppRGCTXDefinition { int32 type; int32 data }。
+        /// 方法或类型定义用 (rgctxStartIndex, rgctxCount) 指向其中一段；data 为类型表序号（TYPE/CLASS/ARRAY）
+        /// 或 methodSpec 序号（METHOD）。按 (映像名, 令牌) 汇总，与后续版本 CodeGenModule 的 RGCTX 同形。
         /// </summary>
-        private void ReadRgctx(string name, ulong module, Dictionary<(string, uint), RgctxEntry[]> rgctx)
+        private Dictionary<(string, uint), RgctxEntry[]> ReadRgctx()
         {
-            var rangeCount = U32(module + CmRgctxRangeCount);
-            if (rangeCount == 0) return;
-            var ranges = Pointer(module + CmRgctxRanges);
-            var definitions = Pointer(module + CmRgctxs);
-            var count = U32(module + CmRgctxCount);
-            for (var r = 0u; r < rangeCount; r++)
+            var rgctx = new Dictionary<(string, uint), RgctxEntry[]>();
+            var entries = model.MetadataRgctxEntries;
+            if (entries.Count == 0) return rgctx;
+            void Add((string, uint) key, int start, int count)
             {
-                var pair = ranges + r * TokenRangeSize;
-                var token = U32(pair);
-                var start = I32(pair + 4);
-                var length = I32(pair + 8);
-                if (start < 0 || length < 0 || (long)start + length > count) { problems.Add($"{name} RGCTX 区间越界 0x{token:x8}"); continue; }
-                var list = new RgctxEntry[length];
-                for (var k = 0; k < length; k++)
+                if (count <= 0) return;
+                if (start < 0 || (long)start + count > entries.Count) { problems.Add($"RGCTX 区间越界 {key.Item1} 0x{key.Item2:x8}：{start}+{count}"); return; }
+                var list = new RgctxEntry[count];
+                for (var k = 0; k < count; k++)
                 {
-                    var def = definitions + (ulong)(start + k) * RgctxSize;
-                    var kind = (RgctxKind)U32(def);
-                    var data = Pointer(def + 8);
+                    var (kind, data) = entries[start + k];
                     object? value = null;
                     switch (kind)
                     {
                         case RgctxKind.Type or RgctxKind.Class or RgctxKind.Array:
-                            var t = I32(data);
-                            if (t >= 0 && t < model.RuntimeTypes.Count) value = model.RuntimeTypes[t];
-                            else problems.Add($"{name} 0x{token:x8} RGCTX[{k}] {kind} 类型序号越界 {t}");
+                            if (data >= 0 && data < model.RuntimeTypes.Count) value = model.RuntimeTypes[data];
+                            else problems.Add($"{key.Item1} 0x{key.Item2:x8} RGCTX[{k}] {kind} 类型序号越界 {data}");
                             break;
                         case RgctxKind.Method:
-                            var m = I32(data);
-                            if (m >= 0 && m < model.MethodSpecs.Count) value = model.MethodSpecs[m];
-                            else problems.Add($"{name} 0x{token:x8} RGCTX[{k}] methodSpec 序号越界 {m}");
-                            break;
-                        case RgctxKind.Constrained:
-                            var constrainedType = I32(data);
-                            var encoded = U32(data + 4);
-                            var method = model.DecodeToken(encoded >> 29, (encoded & 0x1FFFFFFF) >> 1)?.Value as MethodRef;
-                            if (constrainedType < 0 || constrainedType >= model.RuntimeTypes.Count || method is null)
-                                problems.Add($"{name} 0x{token:x8} RGCTX[{k}] Constrained 无法解析 ({constrainedType}, 0x{encoded:x})");
-                            else value = (model.RuntimeTypes[constrainedType], method);
+                            if (data >= 0 && data < model.MethodSpecs.Count) value = model.MethodSpecs[data];
+                            else problems.Add($"{key.Item1} 0x{key.Item2:x8} RGCTX[{k}] methodSpec 序号越界 {data}");
                             break;
                         default:
-                            problems.Add($"{name} 0x{token:x8} RGCTX[{k}] 未知种类 {(int)kind}");
+                            problems.Add($"{key.Item1} 0x{key.Item2:x8} RGCTX[{k}] 未知种类 {(int)kind}");
                             break;
                     }
                     list[k] = new RgctxEntry(kind, value);
                 }
-                if (!rgctx.TryAdd((name, token), list)) problems.Add($"{name} RGCTX 令牌 0x{token:x8} 重复");
+                if (!rgctx.TryAdd(key, list)) problems.Add($"{key.Item1} RGCTX 令牌 0x{key.Item2:x8} 重复");
             }
+            foreach (var type in model.Types) Add((type.Assembly, type.Token), type.RgctxStartIndex, type.RgctxCount);
+            foreach (var method in model.Methods) Add((method.Owner.Assembly, method.Token), method.RgctxStartIndex, method.RgctxCount);
+            return rgctx;
         }
 
-        private string ReadCString(ulong address)
-        {
-            var bytes = image.ReadUpTo(address, 512);
-            var end = bytes.IndexOf((byte)0);
-            if (end < 0) throw new InvalidDataException($"0x{address:x} 处字符串未终止");
-            return System.Text.Encoding.UTF8.GetString(bytes[..end]);
-        }
     }
 }

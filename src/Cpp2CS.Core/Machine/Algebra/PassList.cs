@@ -17,8 +17,12 @@ internal sealed class PassList(MachineFunction function, List<PassStep> steps, S
         var result = action();
         rewriter?.Attach(function);
         var after = Statements();
+        var elapsed = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
         steps.Add(new(name, !before.SequenceEqual(after, ReferenceEqualityComparer.Instance), before.Length, after.Length,
-            1, PassConvergence.Single, Stopwatch.GetElapsedTime(started).TotalMilliseconds));
+            1, PassConvergence.Single, elapsed));
+        // 排查长耗时函数：CPP2CS_PASS_TRACE=1 时输出每一步耗时。
+        if (elapsed >= 200 && Environment.GetEnvironmentVariable("CPP2CS_PASS_TRACE") == "1")
+            Console.Error.WriteLine($"pass {name} {elapsed:F0}ms {before.Length}→{after.Length}");
         return result;
     }
 

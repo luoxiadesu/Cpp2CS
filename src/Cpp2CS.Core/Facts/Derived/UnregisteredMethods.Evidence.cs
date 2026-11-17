@@ -7,6 +7,46 @@ namespace Cpp2CS.Facts.Derived;
 
 public static partial class UnregisteredInference
 {
+    /// <summary>单个目标的耗时监视：主线程进入目标后，超过阈值仍停留在该目标时由后台线程输出一次。</summary>
+    private sealed class Watchdog : IDisposable
+    {
+        private readonly Action<string>? log;
+        private readonly string format;
+        private readonly System.Diagnostics.Stopwatch clock = System.Diagnostics.Stopwatch.StartNew();
+        private readonly Thread worker;
+        private long target;
+        private int since;
+        private volatile bool stopped;
+
+        public Watchdog(Action<string>? log, string format)
+        {
+            this.log = log;
+            this.format = format;
+            worker = new Thread(Loop) { IsBackground = true };
+            worker.Start();
+        }
+
+        public void Enter(ulong entry, double seconds)
+        {
+            Interlocked.Exchange(ref target, (long)entry);
+            Volatile.Write(ref since, (int)(seconds * 1000));
+        }
+
+        private void Loop()
+        {
+            while (!stopped)
+            {
+                Thread.Sleep(5000);
+                var entry = (ulong)Interlocked.Read(ref target);
+                if (entry == 0) continue;
+                var elapsed = clock.Elapsed.TotalSeconds - Volatile.Read(ref since) / 1000.0;
+                if (elapsed > 20) log?.Invoke(string.Format(format, entry, elapsed));
+            }
+        }
+
+        public void Dispose() => stopped = true;
+    }
+
     private sealed class Observation(ulong caller, CodeRef reference)
     {
         public ulong Caller { get; } = caller;
@@ -41,11 +81,15 @@ public static partial class UnregisteredInference
         {
             var result = new UnregisteredMethods();
             var functions = facts.Code.Functions.Where(f => f.Region == CodeRegion.Managed && facts.EntriesAt(f.Start).Length == 0).ToDictionary(f => f.Start);
+            log?.Invoke($"未注册推断：无注册入口的托管函数 {functions.Count} 个");
             var sites = facts.Scan.All.Where(r => r.Kind is RefKind.Call or RefKind.TailCall && functions.ContainsKey(r.Target))
                 .Select(r => new Observation(facts.Code.At(r.Site)!.Start, r)).ToArray();
+            var clock = System.Diagnostics.Stopwatch.StartNew();
             Observe(sites);
+            log?.Invoke($"未注册推断：调用者提升与归一 {clock.Elapsed.TotalSeconds:F1}s");
             // 整个注册集合参与歧义否决；不能先按 A 的定义过滤再宣布 B 唯一。
             var shapes = RegisteredShapes();
+            log?.Invoke($"未注册推断：注册指纹 {clock.Elapsed.TotalSeconds:F1}s");
             var conflicts = new List<string>();
             var abiProblems = new List<string>();
             var contradictions = new List<string>();
@@ -122,10 +166,24 @@ public static partial class UnregisteredInference
         {
             var lifter = new FunctionLifter(facts);
             var rewriter = new IdiomRewriter(facts) { RecordFilter = _ => false };
-            foreach (var group in sites.GroupBy(s => s.Caller))
+            var groups = sites.GroupBy(s => s.Caller).ToArray();
+            log?.Invoke($"未注册推断：提升调用者 {groups.Length} 个（调用点 {sites.Length}）");
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            var done = 0;
+            // 单个调用者长时间不结束时打印当前目标，避免整段无输出。
+            var watching = new Watchdog(log, $"未注册推断：0x{{0:x}} 已用时 {{0:F0}}s");
+            foreach (var group in groups)
             {
+                watching.Enter(group.Key, clock.Elapsed.TotalSeconds);
+                var started = clock.Elapsed.TotalSeconds;
+                if (++done % 128 == 0)
+                    log?.Invoke($"未注册推断：已提升 {done}/{groups.Length}，{clock.Elapsed.TotalSeconds / done:F2}s/个");
                 var lifted = lifter.Lift(group.Key);
                 var rewritten = lifted.Succeeded ? rewriter.Run(lifted.Function) : null;
+                var spent = clock.Elapsed.TotalSeconds - started;
+                if (spent > 1)
+                    log?.Invoke($"未注册推断：0x{group.Key:x} {group.Count()} 调用点耗时 {spent:F1}s" +
+                        (group.Count() > 0 ? $"（{string.Join(" | ", facts.EntriesAt(group.Key).Select(e => e.Method?.ToString() ?? e.Kind.ToString()).DefaultIfEmpty("无注册入口"))}）" : ""));
                 if (!lifted.Succeeded || rewritten!.Errors.Count > 0)
                 {
                     foreach (var site in group) site.Failed = true;
@@ -154,6 +212,7 @@ public static partial class UnregisteredInference
                     }
                 }
             }
+            watching.Dispose();
             log?.Invoke($"未注册定义 A 普查完成：{sites.Select(s => s.Caller).Distinct().Count()} 调用者");
         }
 

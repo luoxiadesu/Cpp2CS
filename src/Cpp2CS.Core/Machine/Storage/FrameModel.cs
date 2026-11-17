@@ -57,9 +57,14 @@ internal sealed class FrameModel
         this.calls = calls;
         foreach (var statement in function.Blocks.SelectMany(b => b.Statements))
             if (statement is Define define) definitions[define.Target] = define.Value;
+        var trace = Environment.GetEnvironmentVariable("CPP2CS_PASS_TRACE") == "1";
+        var watch = System.Diagnostics.Stopwatch.StartNew();
         SolvePointers();
+        if (trace) { Console.Error.WriteLine($"frame-model pointers {watch.Elapsed.TotalSeconds:F2}s statements={definitions.Count}"); watch.Restart(); }
         foreach (var statement in function.Blocks.SelectMany(b => b.Statements)) Collect(statement);
+        if (trace) { Console.Error.WriteLine($"frame-model collect {watch.Elapsed.TotalSeconds:F2}s"); watch.Restart(); }
         SolveEscapes();
+        if (trace) Console.Error.WriteLine($"frame-model escapes {watch.Elapsed.TotalSeconds:F2}s");
     }
 
     /// <summary>地址可能指向的帧偏移；不指向固定帧时为空。</summary>
@@ -179,28 +184,51 @@ internal sealed class FrameModel
 
     private void SolvePointers()
     {
+        // 依赖关系：定义语句在它读取的变量集合变化时重算；held（内存中保存的指针）变化时所有含 Load/Store 的语句重算。
         var statements = function.Blocks.SelectMany(b => b.Statements).ToArray();
-        for (var changed = true; changed;)
+        var queue = new Queue<int>(Enumerable.Range(0, statements.Length));
+        var pending = new bool[statements.Length];
+        Array.Fill(pending, true);
+        while (queue.TryDequeue(out var index))
         {
-            changed = false;
-            foreach (var statement in statements)
-                switch (statement)
-                {
-                    case Define { Target.Width: 64 } define:
-                        changed |= Add(pointsTo, define.Target, Points(define.Value));
-                        changed |= Add(indexed, define.Target, IndexedRoots(define.Value));
-                        break;
-                    case Phi { Target.Width: 64 } phi:
-                        foreach (var source in phi.Sources)
-                            if (pointsTo.TryGetValue(source, out var incoming)) changed |= Add(pointsTo, phi.Target, incoming.ToArray());
-                        break;
-                    case Store { Value.Width: 64 } store:
-                        var values = Points(store.Value).ToArray();
-                        if (values.Length > 0)
-                            foreach (var slot in Points(store.Target).ToArray()) changed |= Add(held, slot, values);
-                        break;
-                }
+            pending[index] = false;
+            var affected = new List<Variable>();
+            var memory = false;
+            switch (statements[index])
+            {
+                case Define { Target.Width: 64 } define:
+                    if (Add(pointsTo, define.Target, Points(define.Value))) affected.Add(define.Target);
+                    if (Add(indexed, define.Target, IndexedRoots(define.Value))) affected.Add(define.Target);
+                    break;
+                case Phi { Target.Width: 64 } phi:
+                    foreach (var source in phi.Sources)
+                        if (pointsTo.TryGetValue(source, out var incoming) && Add(pointsTo, phi.Target, incoming.ToArray())) affected.Add(phi.Target);
+                    break;
+                case Store { Value.Width: 64 } store:
+                    var values = Points(store.Value).ToArray();
+                    if (values.Length > 0)
+                        foreach (var slot in Points(store.Target).ToArray())
+                            if (Add(held, slot, values)) memory = true;
+                    break;
+            }
+            for (var i = 0; i < statements.Length; i++)
+            {
+                if (pending[i]) continue;
+                var again = affected.Count > 0 && Reads(statements[i], affected);
+                if (!again && memory) again = statements[i] is Store || ExprMap.Operands(statements[i]).SelectMany(ExprMap.Walk).Any(n => n is Load);
+                if (!again) continue;
+                pending[i] = true;
+                queue.Enqueue(i);
+            }
         }
+    }
+
+    private static bool Reads(Stmt statement, List<Variable> variables)
+    {
+        foreach (var operand in ExprMap.Operands(statement))
+            foreach (var node in ExprMap.Walk(operand))
+                if (node is Use use && variables.Contains(use.Variable)) return true;
+        return false;
     }
 
     private static bool Add<TKey>(Dictionary<TKey, HashSet<long>> sets, TKey key, IEnumerable<long> values) where TKey : notnull
@@ -396,10 +424,13 @@ internal static class FrameForwarding
 
     public static bool Run(MachineFunction function, IFrameCallEffects calls)
     {
+        var trace = Environment.GetEnvironmentVariable("CPP2CS_PASS_TRACE") == "1";
+        var clock = System.Diagnostics.Stopwatch.StartNew();
         var any = false;
         for (var round = 0; round < Rounds; round++)
         {
             var model = new FrameModel(function, calls);
+            if (trace) { Console.Error.WriteLine($"frame-forwarding round {round} model {clock.Elapsed.TotalSeconds:F2}s"); clock.Restart(); }
             var changed = false;
             foreach (var block in function.Blocks)
                 for (var i = 0; i < block.Statements.Count; i++)
@@ -423,6 +454,7 @@ internal static class FrameForwarding
                     && slot < 0 && model.Unobserved(slot, store.Value.Width / 8)) > 0;
             if (!changed) break;
             any = true;
+            if (trace) { Console.Error.WriteLine($"frame-forwarding round {round} rewrite {clock.Elapsed.TotalSeconds:F2}s"); clock.Restart(); }
         }
         return any;
     }

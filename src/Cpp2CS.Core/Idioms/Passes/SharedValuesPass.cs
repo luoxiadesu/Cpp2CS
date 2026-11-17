@@ -32,10 +32,6 @@ internal static class SharedValuesPass
         {
             switch (part)
             {
-                case Load { Width: 32 } load when state.defs.Expand(load.Address) is Binary { Op: BinOp.Add, Left: Symbol { Kind: SymbolKind.Class, Value: TypeRef type },
-                        Right: Const { Value: RuntimeLayout.ClassStackSlotSize } }:
-                    changed = true;
-                    return new ClassProperty(type, ClassPropertyKind.StackSlotSize, 32);
                 case Compare when IsValueTest(state.defs.Expand(part)) is { } test:
                     changed = true;
                     return test;
@@ -56,9 +52,14 @@ internal static class SharedValuesPass
         return changed;
     }
 
-    /// <summary>类的 byval_arg 标志最高位是值类型位；条件按该位取两值时方向相反即值类型测试。</summary>
+    /// <summary>
+    /// 类的 byval_arg 标志最高位是值类型位；条件按该位取两值时方向相反即值类型测试。
+    /// 该位是元数据 v27.2 起才有的 Il2CppType.valuetype：更早的版本（如 v24.1）Il2CppType.bits 里没有它，
+    /// 只有完全共享泛型代码才会读出这个测试，因此这些版本上本规则不适用；调用方以 <see cref="RuntimeLayout.HasTypeValuetypeBit"/> 判断。
+    /// </summary>
     private static Expr? IsValueTest(Expr condition)
     {
+        if (!RuntimeLayout.HasTypeValuetypeBit) return null;
         var loads = ExprMap.Walk(condition).OfType<Load>().Distinct().ToArray();
         if (loads is not [{ Width: 32, Address: Binary { Op: BinOp.Add, Left: Symbol { Kind: SymbolKind.Class, Value: TypeRef type },
                 Right: Const { Value: RuntimeLayout.ClassByvalArg + 8 } } } flag]) return null;

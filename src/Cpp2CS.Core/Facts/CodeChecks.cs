@@ -24,9 +24,12 @@ public static class CodeChecks
             var covered = map.Functions.Where(f => section.Contains(f.Start)).Sum(f => (double)f.Size);
             checks.Info($"code.coverage.{section.Name}", (long)section.Size, $"函数覆盖 {100 * covered / section.Size:F4}%");
         }
-        checks.Add("code.gaps.unexplained", "Error", map.Gaps.Count,
+        checks.Add("code.gaps.unexplained", "Error", map.Gaps.Count(g => g.Kind == "unexplained"),
             map.Gaps.Where(g => g.Kind == "unexplained").Select(g => $"{Hex(g.Start)}..{Hex(g.End)}").ToArray(),
             "可执行节中函数之外的区间只能是勘误补丁桩或填充：" + string.Join("，", map.Gaps.GroupBy(g => g.Kind).Select(g => $"{g.Key}={g.Count()}")));
+        checks.Info("code.gaps.unreferenced", map.Gaps.Count(g => g.Kind == "unreferenced-code"),
+            "没有任何引用落入的未覆盖区间（编译器留下的不可达代码块，如冷分区孤立块）：" + string.Join("，", map.Gaps.Where(g => g.Kind == "unreferenced-code")
+                .GroupBy(g => g.End - g.Start).OrderByDescending(g => g.Count()).Take(8).Select(g => $"{g.Key} 字节×{g.Count()}")));
         checks.Add("code.erratum843419", "Error", map.Patches.Count,
             map.Patches.Values.Where(p => p.AdrpPageOffset is null).Select(p => $"{Hex(p.Site)} → {Hex(p.Stub)}").ToArray(),
             "每个补丁位置之前 1–4 条内有 ADRP；ADRP 页内偏移分布：" + string.Join("，", map.Patches.Values
@@ -67,8 +70,13 @@ public static class CodeChecks
         checks.Add("scan.code-pointers", "Error", pointerCount, codePointers, $"ADRP+ADD / ADR 构造的、指向所在函数之外的代码地址都是函数入口（函数内局部标号 {localLabels} 处）");
 
         var relocated = image.RelocatedPointerTargets().Where(image.IsExecutable).Distinct().ToArray();
-        checks.Add("reloc.code-pointers", "Error", relocated.Length,
-            relocated.Where(t => !map.IsEntry(t)).Select(Where).ToArray(), "重定位写入的代码指针都是函数入口");
+        // 可执行段内、但没有节头覆盖的地址（如附加代码段）不属于已建模的函数区域，单列核对而不是要求它是入口。
+        var sectioned = relocated.Where(t => image.SectionAt(t) is not null).ToArray();
+        var unsectioned = relocated.Except(sectioned).ToArray();
+        checks.Add("reloc.code-pointers", "Error", sectioned.Length,
+            sectioned.Where(t => !map.IsEntry(t)).Select(Where).ToArray(), "重定位写入的代码指针都是函数入口");
+        checks.Info("reloc.code-pointers.unsectioned", unsectioned.Length,
+            "重定位写入、落在可执行段但无节头的代码指针：" + string.Join("，", unsectioned.Take(8).Select(Where)));
 
         checks.Add("registrations.entries-at-functions", "Error", registrations.Entries.Count,
             registrations.Entries.Where(e => !map.IsEntry(e.Address)).Select(e => $"{e.Kind} {Where(e.Address)} {e.Method}").ToArray(),

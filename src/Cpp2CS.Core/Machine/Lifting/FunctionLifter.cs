@@ -145,27 +145,42 @@ public sealed class FunctionLifter
     public LiftedFunction Lift(ulong entry, Expr? returnValue, ReturnPiece[]? returnPieces, bool simplify, bool promoteFrameSlots,
         IReadOnlyDictionary<ulong, int>? tableCounts = null)
     {
+        var trace = entry == LiftTraceEntry;
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        void Mark(string stage) { if (trace) { System.Console.Error.WriteLine($"lift 0x{entry:x} {stage} {clock.Elapsed.TotalSeconds:F2}s"); clock.Restart(); } }
         var function = cfg.Build(entry, tableCounts);
+        Mark("cfg");
         if (InlinesClosures && !promoteFrameSlots) new ClosureInlining(cfg, IsClosure, IsOutlinedHelper, Machine.Convention.IntegerArguments[0], Machine.Convention.StackPointer, Storage.Gpr(29), CalleeSaved).Run(function);
         var dominators = Dominators.Compute(function);
         SsaBuilder.PrepareCalls(function, calls, returnValue, Machine.Convention.StackPointer, returnPieces);
         SsaBuilder.Build(function, dominators, s => s.Bank is Bank.Gpr or Bank.Vec or Bank.Flags or Bank.Temp, calls, Machine.Convention.StackPointer);
         var errors = SsaCheck.Verify(function, dominators);
+        Mark($"ssa {errors.Count} 错误");
         if (errors.Count > 0) return new(function, errors.Select(e => "构建: " + e).ToList());
         // 参数使用证明需要原始 SSA，不能先删除未使用的读取或简化分支。
         if (!simplify) return new(function, errors);
-        do Propagate.Run(function, dominators);
+        var rounds = 0;
+        do { Propagate.Run(function, dominators); Mark($"propagate #{++rounds}"); }
         while (FoldConstantMemory(function));
+        Mark($"常量折叠 {rounds} 轮");
         // 帧槽提升：不逃逸的标量栈槽成为存储单元，只对栈槽再构建一次 SSA（FrameSlotPromotion 的条件）。
         if (promoteFrameSlots && FrameSlotPromotion.Run(function) > 0)
         {
             SsaBuilder.Build(function, dominators, s => s.Bank == Bank.Stack, calls, Machine.Convention.StackPointer);
-            do Propagate.Run(function, dominators);
+            rounds = 0;
+            do { Propagate.Run(function, dominators); Mark($"提升后 propagate #{++rounds}"); }
             while (FoldConstantMemory(function));
+            Mark($"提升后常量折叠 {rounds} 轮");
         }
+        if (clock.Elapsed.TotalSeconds >= 2) System.Console.Error.WriteLine($"lift 慢 0x{entry:x} {clock.Elapsed.TotalSeconds:F1}s");
         return new(function, SsaCheck.Verify(function, dominators));
     }
 
+    /// <summary>LIFT_TRACE 指定的入口在提升各阶段输出耗时（排查长耗时函数）。</summary>
+    private static readonly string LiftTraceSetting = System.Environment.GetEnvironmentVariable("CPP2CS_LIFT_TRACE") ?? "";
+    private static readonly ulong LiftTraceEntry =
+        LiftTraceSetting is { Length: > 0 } && LiftTraceSetting != "*"
+            ? System.Convert.ToUInt64(LiftTraceSetting.StartsWith("0x", StringComparison.Ordinal) ? LiftTraceSetting[2..] : LiftTraceSetting, 16) : 0;
     /// <summary>常量地址上的读取若来自常量内存则替换为常量。返回是否有替换。</summary>
     private bool FoldConstantMemory(MachineFunction function)
     {

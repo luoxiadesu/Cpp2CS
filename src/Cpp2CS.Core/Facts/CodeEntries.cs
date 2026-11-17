@@ -4,13 +4,13 @@ namespace Cpp2CS.Facts;
 /// <summary>注册表中出现的代码入口种类。</summary>
 public enum EntryKind
 {
-    /// <summary>非泛型方法实现（CodeGenModule.methodPointers）。</summary>
+    /// <summary>非泛型方法实现（CodeRegistration.methodPointers）。</summary>
     Method,
     /// <summary>泛型方法实例或泛型类型上的方法实例（genericMethodPointers，经 genericMethodTable 对应 MethodSpec）。</summary>
     GenericMethod,
-    /// <summary>值类型实例方法的 this 调整桩（CodeGenModule.adjustorThunks）：装箱对象指针 + 0x10 后转到方法本体。</summary>
+    /// <summary>值类型实例方法的 this 调整桩（CodeGenModule.adjustorThunks，v24.2 起）：装箱对象指针 + 0x10 后转到方法本体。</summary>
     AdjustorThunk,
-    /// <summary>泛型值类型方法实例的 this 调整桩（genericAdjustorThunks）。</summary>
+    /// <summary>泛型值类型方法实例的 this 调整桩（genericAdjustorThunks，v24.5/v27.1 起）。</summary>
     GenericAdjustorThunk,
     /// <summary>反射/委托调用用的调用器（invokerPointers）。</summary>
     Invoker,
@@ -52,7 +52,7 @@ public sealed class Registrations
     public required IReadOnlyDictionary<ulong, CodeEntry[]> ByAddress { get; init; }
     /// <summary>RGCTX：键为 (程序集映像名, 令牌)，令牌为方法（0x06）或类型（0x02）。</summary>
     public required IReadOnlyDictionary<(string Image, uint Token), RgctxEntry[]> Rgctx { get; init; }
-    /// <summary>metadataRegistration.metadataUsages 列出的槽位地址；v27+ 可能为空。</summary>
+    /// <summary>metadataRegistration.metadataUsages 列出的槽位地址（v24 槽位在 .bss，初值 0；用途编码在元数据用途表中）。</summary>
     public required IReadOnlyList<ulong> MetadataUsageSlots { get; init; }
     /// <summary>metadataRegistration.types 中每个 Il2CppType 的地址 → 运行时类型序号。</summary>
     public required IReadOnlyDictionary<ulong, int> TypePointers { get; init; }

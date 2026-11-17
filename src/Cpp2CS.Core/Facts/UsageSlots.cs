@@ -1,19 +1,19 @@
 
 namespace Cpp2CS.Facts;
 
-/// <summary>一个运行时元数据槽位（v27+ 全局变量，初值为编码令牌，运行时替换为指针）。</summary>
+/// <summary>一个运行时元数据槽位（v27+ 为初值即编码令牌的全局变量；v24 为 .bss 中初值 0、编码来自 metadataUsagePairs 的地址）。</summary>
 /// <summary>LoadingFunctions：直接读取槽位内容的函数数；AddressingFunctions：取得槽位地址（经 GOT 或 ADRP+ADD）的函数数。</summary>
 public sealed record UsageSlot(ulong Address, Usage Usage, int LoadingFunctions, int AddressingFunctions);
 
 /// <summary>
-/// 元数据槽位表。以托管代码对槽位的引用为锚：被引用且初值能按 ((kind&lt;&lt;29)|(index&lt;&lt;1))+1 解码的位置即槽位。
+/// 元数据槽位表。以托管代码对槽位的引用为锚，只要该位置能按 <see cref="ProgramModel.UsageAt"/> 解出用途即计入：
+/// v27+ 依据可解码的初值 ((kind&lt;&lt;29)|(index&lt;&lt;1))+1，v24 依据元数据 metadataUsagePairs 给出的槽位映射。
 /// 本映像以 PIC 方式经 GOT 访问全局变量：ADRP+LDR 读出 .got 项（RELATIVE 重定位给出槽位地址），
 /// 再把槽位地址交给初始化 helper 或从中读取运行时指针；因此引用分为直接（ADRP+LDR/ADD 到槽位）与经 GOT 两类。
 /// 另对可写数据节逐字扫描可解码的值，用于核对（只被扫描到而无代码引用的，单独列出，不并入槽位表）。
 /// </summary>
 public sealed class UsageSlots
-{
-    public required IReadOnlyDictionary<ulong, UsageSlot> Slots { get; init; }
+{    public required IReadOnlyDictionary<ulong, UsageSlot> Slots { get; init; }
     /// <summary>可写数据中可解码、但没有托管代码引用的位置。</summary>
     public required IReadOnlyDictionary<ulong, Usage> UnreferencedDecodable { get; init; }
     /// <summary>调用目标 → 调用点之前 4 条内以 ADRP+ADD 构造了槽位地址的调用点数（元数据初始化 helper 的证据）。</summary>
@@ -24,7 +24,8 @@ public sealed class UsageSlots
     public static UsageSlots Build(ProgramModel model, CodeMap map, CodeScan scan)
     {
         var image = model.Image;
-        var writable = image.Sections.Where(s => (s.Flags & 1) != 0 && !s.Executable && s.Type != 8).ToArray();
+        // 可写节包括 .bss（SHT_NOBITS）：v24 的元数据槽位在 .bss、初值为 0，用途来自元数据用途表。
+        var writable = image.Sections.Where(s => (s.Flags & 1) != 0 && !s.Executable).ToArray();
         var got = image.Section(".got");
         // 引用目标 → 槽位地址：经 GOT 的 8 字节读取取重定位后的指针，其余直接取目标。
         ulong? SlotOf(CodeRef r)
@@ -96,6 +97,6 @@ public sealed class UsageSlots
             checks.Add("usage.registration-list", "Error", listed.Count,
                 Slots.Keys.Where(k => !listed.Contains(k)).Select(k => $"0x{k:x}").ToArray(), "代码引用的槽位都在 metadataUsages 表中");
         }
-        else checks.Info("usage.registration-list", 0, "metadataRegistration.metadataUsages 为空（v27+ 槽位只以编码初值存在）");
+        else checks.Info("usage.registration-list", 0, "metadataRegistration.metadataUsages 为空：槽位只以用途编码或 .bss 地址存在");
     }
 }

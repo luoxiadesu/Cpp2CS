@@ -60,8 +60,6 @@ internal static class DispatchResolution
         if (SymTable.Resolve(values.Operands(call)[0]) is not ReadSym { Width: 64 } target) return null;
         if (SymTable.Resolve(target.Address) is ResultSym { Site: Call { Op: { Kind: OpKind.InterfaceInvokeData, Operand: ValueTuple<object?, int> { Item1: DefinitionRef itf } lookup } } })
             return Slot(itf, lookup.Item2, interfaceOnly: true);
-        if (oracle.Decompose(target.Address) is (ResultSym { Site: Call { Op: { Kind: OpKind.ResolveGenericVirtual, Operand: MethodRef generic } } }, RuntimeLayout.MethodVirtualPointer, null, _))
-            return generic;
         return oracle.Decompose(target.Address) is (_, var offset, null, _) && offset >= RuntimeLayout.ClassVtable
             && (offset - RuntimeLayout.ClassVtable) % RuntimeLayout.VirtualInvokeDataSize == 0 && Receiver(call, values) is { } receiver
             ? oracle.VirtualMethod(target, receiver) : null;

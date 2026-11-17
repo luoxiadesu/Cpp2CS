@@ -112,6 +112,8 @@ public sealed class ImageDocument
 
     public bool IsExecutable(ulong address)
     {
+        // 节头精确：同一 PT_LOAD 段可能同时覆盖 .text 与 .rodata，段标志无法区分。
+        if (SectionAt(address) is { } section) return section.Executable;
         var mapping = Resolve(address);
         return mapping.Kind == AddressKind.FileBacked && mapping.Range!.Executable;
     }
@@ -120,7 +122,7 @@ public sealed class ImageDocument
     public ReadOnlySpan<byte> Read(ulong address, int size)
     {
         var mapping = Resolve(address);
-        if (mapping.Kind != AddressKind.FileBacked || (ulong)size > mapping.AvailableBytes)
+        if (mapping.Kind != AddressKind.FileBacked || (ulong)size > Available(mapping))
             throw new InvalidDataException($"地址未完整映射到文件：0x{address:X}+{size}");
         return bytes.AsSpan(checked((int)mapping.FileOffset!.Value), size);
     }
@@ -130,9 +132,13 @@ public sealed class ImageDocument
     {
         var mapping = Resolve(address);
         if (mapping.Kind != AddressKind.FileBacked) return [];
-        var available = (int)Math.Min((ulong)size, mapping.AvailableBytes);
+        var available = (int)Math.Min((ulong)size, Available(mapping));
         return bytes.AsSpan(checked((int)mapping.FileOffset!.Value), available);
     }
+
+    /// <summary>映射声明的文件字节数与实际文件长度的较小者：节头声明的范围可能超出文件末尾。</summary>
+    private ulong Available(AddressResolution mapping) =>
+        Math.Min(mapping.AvailableBytes, (ulong)(bytes.Length - mapping.FileOffset!.Value));
 
     /// <summary>
     /// 读取加载后（按首选基址）的指针值：应用 ELF RELATIVE/符号重定位，零填充区为 0。

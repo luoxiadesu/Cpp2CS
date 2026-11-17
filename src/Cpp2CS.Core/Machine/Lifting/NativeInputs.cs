@@ -73,7 +73,7 @@ internal static class NativeInputs
         }
         // invoke_impl、method_code 和 method 来自同一委托；这里只证明尾调用，不裁剪未知 Invoke 的实参。
         return Field(call.Target) is { Root: { } root, Offset: 0x18 }
-            && call.Arguments.Length > 1 && Field(call.Arguments[0]) == (root, 0x40)
+            && call.Arguments.Length > 1 && Field(call.Arguments[0]) == (root, RuntimeLayout.DelegateMethodCode)
             && call.Arguments.Skip(1).Any(a => Field(a) == (root, 0x28));
     }
 

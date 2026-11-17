@@ -80,6 +80,8 @@ public sealed partial class RuntimeHelpers
     private const int ClosureDepth = 4;
     private const int ClosureFunctionLimit = 96;
     private const int ExceptionWrapperLimit = 24;
+    /// <summary>扫描整个函数体的窗口：类初始化等运行时函数有几百字节，字段访问散落其中。</summary>
+    private const int WholeFunction = int.MaxValue / 8;
 
     private static readonly (string Export, HelperKind Kind)[] ExportKinds =
     [
@@ -187,9 +189,73 @@ public sealed partial class RuntimeHelpers
             if (map.Word(pc) is { } w) yield return (pc, w);
     }
 
-    /// <summary>无符号偏移读取 [Xn, #offset]（任意宽度）的指令是否出现在函数前 limit 条中。</summary>
-    private bool LoadsOffset(ulong address, int offset, int limit = 24) =>
-        Words(address, limit).Any(x => A64.IsUnsignedOffsetAccess(x.Word) && !A64.IsStore(x.Word) && (int)A64.AccessOffset(x.Word) == offset);
+    /// <summary>
+    /// 全局元数据初始化的 v24 形态：以参数为下标、按 8 字节步长（add ..., uxtw #3）取用途表项，
+    /// 再交给按 lsr #29 解码种类的函数处理。索引寻址在本函数、种类解码在其直接调用目标里。
+    /// </summary>
+    private bool HasUsageTableDecode(ulong address)
+    {
+        var function = map.At(address);
+        if (function is null) return false;
+        var table = false;
+        for (var pc = function.Start; pc < function.End && !table; pc += 4)
+            if (map.Word(pc) is { } w && (w & 0xFFE0FC00) == 0x8B204C00) table = true;
+        if (!table) return false;
+        foreach (var callee in CallsOf(address))
+            if (map.At(callee) is { } target && HasKindDecode(target)) return true;
+        return false;
+    }
+
+    /// <summary>函数体内有 lsr wD, wN, #29（元数据用途编码的种类字段）。</summary>
+    private bool HasKindDecode(CodeFunction function)
+    {
+        for (var pc = function.Start; pc < function.End; pc += 4)
+            if (map.Word(pc) is { } w && (w & 0xFFC0FC00) == 0x53007C00 && ((w >> 16) & 0x3F) == 29) return true;
+        return false;
+    }
+
+    /// <summary>函数体内是否有独占/释放语义的原子读写（ldaxr/stlxr 家族）。</summary>
+    private bool HasAtomic(ulong address)
+    {
+        var function = map.At(address);
+        if (function is null) return false;
+        for (var pc = function.Start; pc < function.End; pc += 4)
+            if (map.Word(pc) is { } w && (w & 0xBFFFFC00) is 0x885FFC00 or 0x8809FC00) return true;
+        return false;
+    }
+
+    /// <summary>函数体内是否把基址加常量 offset 算进寄存器（add xN, xM, #offset）。</summary>
+    private bool Displaces(ulong address, int offset)
+    {
+        var function = map.At(address);
+        if (function is null) return false;
+        for (var pc = function.Start; pc < function.End; pc += 4)
+            if (map.Word(pc) is { } w && A64.IsAddImmediate64(w) && A64.AddImmediate(w) == (ulong)offset) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// 无符号偏移读取字段 offset 是否出现在函数前 limit 条中。
+    /// 编译器也常把基址先算进寄存器（add xN, xM, #off）再以 [xN, #0] 访问，两种写法都算。
+    /// </summary>
+    private bool LoadsOffset(ulong address, int offset, int limit = 24)
+    {
+        var bases = new Dictionary<int, int>();
+        foreach (var (pc, w) in Words(address, limit))
+        {            if (A64.IsUnsignedOffsetAccess(w) && !A64.IsStore(w))
+            {
+                var literal = (int)A64.AccessOffset(w);
+                if (literal == offset) return true;
+                if (literal == 0 && bases.TryGetValue(A64.Rn(w), out var displaced) && displaced == offset) return true;
+            }
+            // add xN, xM, #imm：记录 xN 相对 xM 的位移；随后覆盖写 xN 的指令使它失效。
+            if (A64.IsAddImmediate64(w) && A64.AddImmediate(w) is var add && add != 0)
+                bases[A64.Rd(w)] = bases.GetValueOrDefault(A64.Rn(w)) + (int)add;
+            else if (A64.MayWriteRd(w) && A64.Rd(w) != 31)
+                bases.Remove(A64.Rd(w));
+        }
+        return false;
+    }
 
     private IEnumerable<ulong> CallsOf(ulong address)
     {
@@ -229,17 +295,6 @@ public sealed partial class RuntimeHelpers
         if (ExecutingAssemblyBody(target))
             return (HelperKind.ExecutingAssembly, null,
                 $"读取 MethodInfo+0x{RuntimeLayout.MethodKlass:x} klass、Il2CppClass+0x{RuntimeLayout.ClassImage:x} image、Il2CppImage+0x{RuntimeLayout.ImageAssembly:x} assembly 后尾调用取反射对象");
-        if (map.At(body) is { ExceptionRegions.Length: 0 } valueRange && valueRange.Start == body
-            && valueRange.Size == 60 && GenericHasValueBody(words))
-            return (HelperKind.GenericHasValue, null, "完整函数按 byval_arg 值类型位、generic_class 和 nullabletype 位检查引用或 Nullable.hasValue");
-        if (map.At(body) is { ExceptionRegions.Length: 0 } constrainedRange && constrainedRange.Start == body)
-        {
-            var longer = Words(body, 72).Select(x => x.Word).ToArray();
-            if (ConstrainedCallBody(longer))
-                return (HelperKind.ConstrainedCall, null, "按 byval_arg 值类型位分支：引用经 objBuffer 取对象并查找虚方法，值类型按声明类判断直接调用或装箱到 boxBuffer，最后尾调用 invoker_method");
-            if (UnboxAnyBody(longer))
-                return (HelperKind.UnboxAny, null, "按 byval_arg 值类型位分支：引用做实例检查后写入 storage，值类型比较 element_class 后取盒内地址，Nullable 写入 storage");
-        }
         if (map.At(body) is { ExceptionRegions.Length: 0 } range && range.Start == body
             && CheckedByteArrayBody(words) && calls is [var bounds]
             && InternalCall(bounds) is { Kind: HelperKind.Throw, Detail: "System.IndexOutOfRangeException" })
@@ -272,6 +327,20 @@ public sealed partial class RuntimeHelpers
                 return (HelperKind.InitMethodRgctx, null,
                     $"调用 0x{wrapperCalls[0]:x}（读取 MethodInfo+0x{RuntimeLayout.MethodRgctxData:x} rgctx_data 与 +0x{RuntimeLayout.MethodGenericMethod:x} genericMethod）后返回原 MethodInfo");
         }
+        // Class::Init 本体：读 +0x127 的 size_inited 提前返回，否则在 +0xD8 的 cctor_finished_or_no_cctor 与
+        // +0xD4 的 cctor_started 上做原子比较交换。与带包装的 InitializedTypeInfo 是同一语义，只是调用点直接进入本体。
+        // 这两个字段经 add 基址 + 原子访问（ldaxr/stlxr）读写，不走普通偏移访存，因此按“基址位移出现 + 原子访问”判定。
+        if (LoadsOffset(body, RuntimeLayout.ClassBitflags2, WholeFunction) && HasAtomic(body)
+            && Displaces(body, RuntimeLayout.ClassCctorFinishedOrNoCctor) && Displaces(body, RuntimeLayout.ClassCctorStarted))
+            return (HelperKind.InitializedTypeInfo, null,
+                $"函数体内读 Il2CppClass+0x{RuntimeLayout.ClassBitflags2:x} size_inited，并在 +0x{RuntimeLayout.ClassCctorFinishedOrNoCctor:x} cctor_finished 与 " +
+                $"+0x{RuntimeLayout.ClassCctorStarted:x} cctor_started 上做原子比较交换");
+        // v24 的全局元数据初始化：按参数下标的用途表项（Il2CppMetadataUsagePair：slot, encoded），
+        // encoded >> 29 取种类后分派初始化，最后写入槽位。特征是指令流里有 uxtw #3 的索引寻址、lsr #29 的种类解码。
+        if (HasUsageTableDecode(body))
+            return (HelperKind.InitMetadata, null,
+                "以参数索引 metadataUsagePairs（8 字节一项）取 (槽位, 编码)，按 lsr #29 的种类分派初始化并写回槽位");
+
         // cbz x0, ...（0xB4000000 | imm19 << 5 | Rt=0）出现在前 6 条：空对象直接返回
         if (calls.Length >= 1 && KindAt(calls[0]) == HelperKind.IsAssignableFrom && words.Take(6).Any(w => (w & 0xFF00001F) == 0xB4000000))
             return (HelperKind.IsInst, null, $"空对象直接返回，否则调用 is_assignable_from 实现 0x{calls[0]:x}");
@@ -279,8 +348,37 @@ public sealed partial class RuntimeHelpers
             return (HelperKind.ArrayElementAddress, null, $"读取 Il2CppClass+0x{RuntimeLayout.ClassElementSize:x} element_size，并加数组头 0x{RuntimeLayout.ArrayData:x}");
         if (words.Length <= 10 && LoadsOffset(body, RuntimeLayout.FieldParent, 4) && LoadsOffset(body, RuntimeLayout.FieldOffset, 4) && calls.Length == 0)
             return (HelperKind.FieldAddress, null, $"读取 FieldInfo+0x{RuntimeLayout.FieldOffset:x} offset 加到对象地址（值类型扣除对象头）");
+        // Object::New：读 instance_size 分配存储、把 klass 写到对象头，末尾调用 Class::Init 保证布局已初始化，返回对象。
+        // 类初始化本体在静态链接后没有符号，这里按它自身的结构指纹（见 ClassLayoutInitBody）认定，不依赖递归分类。
+        if (LoadsOffset(body, RuntimeLayout.ClassInstanceSize, WholeFunction) && calls.Any(c => ClassLayoutInitBody(Terminal(c))))
+            return (HelperKind.ObjectNew, null,
+                $"读取 Il2CppClass+0x{RuntimeLayout.ClassInstanceSize:x} instance_size 分配对象，并在返回前调用 Class::Init 完成布局初始化");
+        // Array::New：按 element_size 乘长度分配（多出数组头），把长度写到 Il2CppArray+0x18；
+        // 长度为负时走抛出路径，判定用长度作有符号数检查最高位（lsr #31 后接条件分支）。
+        if (HasSignedLengthCheck(body, Words(body, 48)) && words.Any(w => A64.IsAddImmediate64(w) && A64.AddImmediate(w) == RuntimeLayout.ArrayData))
+            return (HelperKind.NewArray, null,
+                $"按 Il2CppClass+0x{RuntimeLayout.ClassElementSize:x} element_size 乘长度分配并加数组头，把长度写入 Il2CppArray+0x{RuntimeLayout.ArrayMaxLength:x}");
         return null;
     }
+
+    /// <summary>长度作有符号数检查最高位（lsr xD, xN, #31 后接 cbz/cbnz）：数组分配的越界判定。</summary>
+    private static bool HasSignedLengthCheck(ulong address, IEnumerable<(ulong Pc, uint Word)> words)
+    {
+        var list = words.ToArray();
+        for (var i = 0; i + 1 < list.Length; i++)
+            if ((list[i].Word & 0xFFC00000) == 0xD3400000 && ((list[i].Word >> 16) & 0x3F) == 31
+                && (list[i + 1].Word & 0x7F000000) is 0x34000000 or 0x35000000)
+                return true;
+        return false;
+    }
+
+    /// <summary>
+    /// Class::Init 本体的结构指纹：读 +0x127 的 size_init_pending 提前返回，并在 +0xD8 cctor_finished_or_no_cctor
+    /// 与 +0xD4 cctor_started 上做原子比较交换。静态链接后没有导出名，只能按函数体认定。
+    /// </summary>
+    private bool ClassLayoutInitBody(ulong body) =>
+        LoadsOffset(body, RuntimeLayout.ClassBitflags2, WholeFunction) && HasAtomic(body)
+        && Displaces(body, RuntimeLayout.ClassCctorFinishedOrNoCctor) && Displaces(body, RuntimeLayout.ClassCctorStarted);
 
     private ulong? interfaceSlowPath;
 

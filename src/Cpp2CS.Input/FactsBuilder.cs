@@ -30,6 +30,9 @@ namespace Cpp2CS.Input
             var (registrations, problems) = Step("registrations", () => RegistrationReader.Read(model, builder.CodeRegistration, builder.MetadataRegistration));
 
             var checks = new FactChecks();
+            // 模型构建的诊断：泛型槽未实例化、公钥与标记不符、特性解析失败等。不阻断建模，但属于已知缺口。
+            checks.Add("model.problems", "Warning", model.Types.Count, (IReadOnlyCollection<string>)builder.Problems,
+                $"模型构建诊断 {builder.Problems.Count} 条（元数据版本 {model.MetadataVersion}）");
             checks.Add("registrations.read", "Error", registrations.Entries.Count, (IReadOnlyCollection<string>)problems,
                 $"CodeRegistration 0x{builder.CodeRegistration:x}，MetadataRegistration 0x{builder.MetadataRegistration:x}，元数据版本 {model.MetadataVersion}");
             Step("checks.code", () => { CodeChecks.Run(checks, map, scan, registrations); return 0; });
@@ -44,7 +47,8 @@ namespace Cpp2CS.Input
             var shared = generic.Where(e => e.Method!.TypeArguments.Concat(e.Method.MethodArguments).Any(FieldLayouts.IsFullyShared)).ToArray();
             checks.Info("generic.fully-shared", generic.Length,
                 $"泛型方法实例代码 {generic.Length} 个，其中实参含完全共享占位类型（偏移、大小经 RGCTX 在运行时取得）的 {shared.Length} 个；" +
-                $"共享实例所属 Assembly-CSharp 类型 {shared.Count(e => e.Method!.Method.Owner.Assembly == "Assembly-CSharp.dll")} 个方法");
+                "按程序集：" + string.Join("，", shared.GroupBy(e => e.Method!.Method.Owner.Assembly).OrderByDescending(g => g.Count())
+                    .Select(g => $"{g.Key}={g.Count()}")));
             var basis = new BaseFacts
             {
                 Model = model,

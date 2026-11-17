@@ -25,7 +25,18 @@ public static partial class UnregisteredInference
             return text;
         }
 
+        // 指纹只依赖函数入口处的代码与引用；同一入口在候选比较与注册同形表里反复出现，缓存避免重复构造字符串与哈希。
+        private readonly Dictionary<ulong, ShapeKey> fingerprints = [];
+
         private ShapeKey Fingerprint(CodeFunction function, Action<string>? describe = null)
+        {
+            if (describe is null && fingerprints.TryGetValue(function.Start, out var cached)) return cached;
+            var key = FingerprintUncached(function, describe);
+            if (describe is null) fingerprints[function.Start] = key;
+            return key;
+        }
+
+        private ShapeKey FingerprintUncached(CodeFunction function, Action<string>? describe)
         {
             var refs = facts.Scan.Of(facts.Code.EntryIndex(function.Start)).ToArray();
             var adrpSites = new HashSet<ulong>();

@@ -201,7 +201,7 @@ internal sealed class DelegateCallNormalizer
         bool Field(Expr? value, long offset) => value is not null && JoinedField(value, block, call) is Load { Width: 64 } load
             // Load 定义不可展开后比较：同一字段在两次读取之间可能已被写过，只有同一个 SSA 根才是见证。
             && Split(load.Address) is { Root: { } other } split && split.Offset == offset && Equals(root, other);
-        if (!Field(registers.GetValueOrDefault(Storage.Gpr(0)), 0x40) || (typeOf?.Invoke(root) ?? TypeOf(root, [])) is not DefinitionRef type
+        if (!Field(registers.GetValueOrDefault(Storage.Gpr(0)), RuntimeLayout.DelegateMethodCode) || (typeOf?.Invoke(root) ?? TypeOf(root, [])) is not DefinitionRef type
             || DelegateFacts.Invoke(type) is not { } invoke || abi.Classify(invoke, out _) is not { } signature
             // 参数占满寄存器时 MethodInfo 在栈上，没有寄存器见证；目标与 x0 同根已经指名这个委托。
             || signature.MethodInfo is { } info && !Field(registers.GetValueOrDefault(info.Register), 0x28)) return null;

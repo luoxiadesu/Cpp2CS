@@ -80,6 +80,13 @@ public sealed class FunctionTable
             if (previousStart is { } lower && start < lower)
                 throw new InvalidDataException($".eh_frame_hdr 二分表未按 PC 升序：0x{start:x} < 0x{lower:x}");
             previousStart = start;
+            // 二分表里的 FDE 指针可能指向表外或未映射区域：先确认 12 字节头可读，不可读就记为跳过而不是让读取异常中断整表。
+            var resolution = image.Resolve(fde);
+            if (resolution.Kind != AddressKind.FileBacked || resolution.AvailableBytes < 12)
+            {
+                skipped.Add($"0x{fde:x}: FDE 地址不可读（{resolution.Kind}，{resolution.AvailableBytes} 字节）");
+                continue;
+            }
             ParseFde(image, start, fde, ranges, skipped);
         }
         var ordered = ranges.OrderBy(r => r.Start).ToArray();
@@ -92,14 +99,17 @@ public sealed class FunctionTable
     // 单个 FDE：只接受 [start, start+range) 与 CIE 增强信息均已核实的条目。
     private static void ParseFde(ImageDocument image, ulong start, ulong fde, List<FunctionRange> ranges, List<string> skipped)
     {
-        var head = image.Read(fde, 12);
+        var head = image.ReadUpTo(fde, 12);
+        if (head.Length < 12) { skipped.Add($"0x{fde:x}: FDE 头越界（{head.Length} 字节）"); return; }
         var length = BinaryPrimitives.ReadUInt32LittleEndian(head);
         if (length is 0 or 0xffffffff) { skipped.Add($"0x{fde:x}: 不支持的 FDE 长度 {length}"); return; }
         var ciePointer = BinaryPrimitives.ReadUInt32LittleEndian(head[4..]);
         var cie = checked(fde + 4 - ciePointer);
+        if (cie >= fde || image.Read(cie, 4).Length < 4) { skipped.Add($"0x{fde:x}: CIE 指针 0x{cie:x} 不可用"); return; }
         var cieLength = BinaryPrimitives.ReadUInt32LittleEndian(image.Read(cie, 4));
         if (cieLength is 0 or > 4096) { skipped.Add($"0x{fde:x}: CIE 长度 {cieLength} 不可用"); return; }
         var cieData = image.Read(cie, checked((int)cieLength + 4));
+        if (cieData.Length < 9) { skipped.Add($"0x{fde:x}: CIE 数据越界（{cieData.Length} 字节）"); return; }
         if (BinaryPrimitives.ReadUInt32LittleEndian(cieData[4..]) != 0 || cieData[8] != 1)
         {
             skipped.Add($"0x{fde:x}: 不支持的 CIE 版本 {BinaryPrimitives.ReadUInt32LittleEndian(cieData[4..])}/{cieData[8]}");
@@ -117,24 +127,32 @@ public sealed class FunctionTable
         SkipLeb(cieData, ref offset);
         SkipLeb(cieData, ref offset);
         SkipLeb(cieData, ref offset);
+        if (offset >= cieData.Length) { skipped.Add($"0x{fde:x}: CIE 增强数据越界"); return; }
         var augmentationSize = cieData[offset++];
         byte lsdaEncoding = 0xff;
         if (augmentation == "zPLR")
         {
-            var personalityEncoding = cieData[offset];
-            if (augmentationSize != 11 || personalityEncoding != 0x9c)
+            // personality 与 LSDA 的编码各按 DW_EH_PE 读取：低 4 位给出长度与基址，
+            // 高 4 位是取值方式（udata4 0x03、sdata4 0x0b 等），不能只认一种组合。
+            if (offset >= cieData.Length) { skipped.Add($"0x{fde:x}: CIE 增强数据缺少 personality 编码"); return; }
+            var personalityEncoding = cieData[offset++];
+            var personalityBytes = AugmentationSize(personalityEncoding);
+            if (personalityBytes <= 0 || offset + personalityBytes >= cieData.Length)
             {
                 skipped.Add($"0x{fde:x}: 不支持的 personality 编码 0x{personalityEncoding:x2}/{augmentationSize}");
                 return;
             }
-            offset += 9;
+            offset += personalityBytes;
+            // CIE 里只有 LSDA 的编码字节；LSDA 指针本身在 FDE 的增强数据中。
             lsdaEncoding = cieData[offset++];
-            if (lsdaEncoding != 0x1c) { skipped.Add($"0x{fde:x}: 不支持的 LSDA 编码 0x{lsdaEncoding:x2}"); return; }
         }
         else if (augmentationSize != 1) { skipped.Add($"0x{fde:x}: 不支持的 CIE 增强长度 {augmentationSize}"); return; }
+        if (offset >= cieData.Length) { skipped.Add($"0x{fde:x}: CIE 数据缺少 FDE 指针编码"); return; }
         if (cieData[offset] != 0x1b) { skipped.Add($"0x{fde:x}: 不支持的 FDE 指针编码 0x{cieData[offset]:x2}"); return; }
-        var declaredStart = checked((ulong)((long)fde + 8 + image.ReadI32(fde + 8)));
-        var range = BinaryPrimitives.ReadUInt32LittleEndian(image.Read(fde + 12, 4));
+        var tail = image.ReadUpTo(fde + 8, 8);
+        if (tail.Length < 8) { skipped.Add($"0x{fde:x}: FDE 起点/长度越界"); return; }
+        var declaredStart = checked((ulong)((long)fde + 8 + BinaryPrimitives.ReadInt32LittleEndian(tail)));
+        var range = BinaryPrimitives.ReadUInt32LittleEndian(tail[4..]);
         if (declaredStart != start) { skipped.Add($"0x{fde:x}: FDE 起点 0x{declaredStart:x} 与二分表 0x{start:x} 不一致"); return; }
         if (range == 0) { skipped.Add($"0x{fde:x}: FDE 范围为零"); return; }
         if (!image.IsExecutable(start))
@@ -147,12 +165,35 @@ public sealed class FunctionTable
             ranges.Add(new(start, checked(start + range), BoundaryEvidence.EhFrame, null));
             return;
         }
-        var augmentationBytes = image.Read(fde + 16, 9);
-        if (augmentationBytes[0] != 8) { skipped.Add($"0x{fde:x}: 不支持的 FDE LSDA 增强长度 {augmentationBytes[0]}"); return; }
-        var lsda = checked((ulong)((long)fde + 17 + BinaryPrimitives.ReadInt64LittleEndian(augmentationBytes[1..])));
+        // FDE 增强：1 字节长度 + LSDA 指针。指针按 CIE 的 L 编码取值，宽度由低 4 位决定（udata4/sdata4 为 4，udata8/sdata8 为 8）。
+        var augmentationBytes = image.ReadUpTo(fde + 16, 1 + 8);
+        if (augmentationBytes.Length < 1) { skipped.Add($"0x{fde:x}: FDE 增强数据越界"); return; }
+        var augmentationLength = augmentationBytes[0];
+        var pointerBytes = AugmentationSize(lsdaEncoding);
+        // 长度字段是增强数据自身的字节数（不含长度字节）：只有一个 LSDA 指针时等于指针宽度。
+        if (augmentationLength != pointerBytes || augmentationBytes.Length < 1 + augmentationLength)
+        {
+            skipped.Add($"0x{fde:x}: 不支持的 FDE LSDA 增强长度 {augmentationLength}");
+            return;
+        }
+        if (pointerBytes is not (4 or 8)) { skipped.Add($"0x{fde:x}: LSDA 指针宽度 {pointerBytes} 不可用"); return; }
+        long lsdaOffset = pointerBytes == 4
+            ? BinaryPrimitives.ReadInt32LittleEndian(augmentationBytes[1..])
+            : BinaryPrimitives.ReadInt64LittleEndian(augmentationBytes[1..]);
+        // LSDA 指针相对 FDE 起点 + 17（1 字节长度之后）。
+        var lsda = checked((ulong)((long)fde + 17 + lsdaOffset));
         var regions = ExceptionTable.Read(image, lsda, start, checked(start + range));
         ranges.Add(new(start, checked(start + range), BoundaryEvidence.EhFrame, null) { ExceptionRegions = regions });
     }
+
+    /// <summary>增强数据中编码值占用的字节数；省略（0xff）为 0，变长编码与其他形式返回 0（调用方记为不支持）。</summary>
+    private static int AugmentationSize(byte encoding) => encoding == 0xff ? 0 : (encoding & 0x0f) switch
+    {
+        0x02 or 0x0a => 2,          // udata2 / sdata2
+        0x03 or 0x0b => 4,          // udata4 / sdata4
+        0x04 or 0x0c => 8,          // udata8 / sdata8
+        _ => 0,                     // LEB128 为变长，absptr 依赖绝对地址：都不出现在本样本的增强数据里
+    };
 
     private static void SkipLeb(ReadOnlySpan<byte> data, ref int offset)
     {

@@ -102,7 +102,11 @@ public sealed class FieldLayouts : ITypeLayouts
             instanceSize = UpdateForGeneric(definition, generic, instanceSize);
             instanceSize = ExplicitClassSize(definition, generic, instanceSize, actualClassSize);
             minimumAlignment = alignment;
-            actualSize = generic || definition.ClassSizeIsDefault != false ? actualClassSize : instanceSize;
+            // 派生类型的字段从父类字段末端（actualClassSize，未按对齐取整）继续排布：元数据中派生类首个字段
+            // 紧接父类的末字段，说明编译器复用了父类的尾部填充。显式声明了更大类大小的类型按声明值占用，
+            // 派生类不能落入这段空间；泛型实例的声明大小来自开放定义，不参与比较。
+            var natural = (actualClassSize + minimumAlignment - 1) & ~(minimumAlignment - 1);
+            actualSize = generic || instanceSize <= natural ? actualClassSize : instanceSize;
             provisional[((type, NativeBindings.Key(type)), preferMetadata)] = new TypeLayout
             {
                 Type = type,
@@ -238,7 +242,10 @@ public sealed class FieldLayouts : ITypeLayouts
         {
             case GenericParameterRef { NativeScalar: { } scalar }: return TrySizeAndAlignment(scalar, preferMetadata);
             case GenericParameterRef { NativeAggregate: { } aggregate }: return TrySizeAndAlignment(aggregate, preferMetadata);
-            case ByRefRef or PointerRef or ArrayRef or GenericParameterRef or PrimitiveRef:
+            case PrimitiveRef p:
+                // 元数据里未解析到定义的基本类型（IL 的 bool/int/…）：按元素大小与自然对齐处理，不能当成指针。
+                return PrimitiveSize(p.Name) is { } size ? (size, size) : (8, 8);
+            case ByRefRef or PointerRef or ArrayRef or GenericParameterRef:
                 return (8, 8);
             case DefinitionRef d:
                 if (PrimitiveSize(d) is { } primitive) return (primitive, primitive);
@@ -269,15 +276,19 @@ public sealed class FieldLayouts : ITypeLayouts
     {
         var t = d.Definition;
         if (t.Assembly != "mscorlib.dll" || t.Namespace != "System" || t.DeclaringType is not null) return null;
-        return t.Name switch
-        {
-            "Boolean" or "SByte" or "Byte" => 1,
-            "Int16" or "UInt16" or "Char" => 2,
-            "Int32" or "UInt32" or "Single" => 4,
-            "Int64" or "UInt64" or "Double" or "IntPtr" or "UIntPtr" => 8,
-            _ => null,
-        };
+        return PrimitiveSize(t.Name);
     }
+
+    /// <summary>基本类型的字节大小。定义引用给 .NET 名，未解析的原始引用给 IL 名（bool/int/…）。</summary>
+    private static int? PrimitiveSize(string name) => name switch
+    {
+        "Boolean" or "bool" or "SByte" or "sbyte" or "Byte" or "byte" => 1,
+        "Int16" or "short" or "UInt16" or "ushort" or "Char" or "char" => 2,
+        "Int32" or "int" or "UInt32" or "uint" or "Single" or "float" => 4,
+        "Int64" or "long" or "UInt64" or "ulong" or "Double" or "double"
+            or "IntPtr" or "nint" or "UIntPtr" or "nuint" => 8,
+        _ => null,
+    };
 
     /// <summary>对全部非泛型类型，以算法重算并与元数据（运行时实际使用的值）逐字段核对。</summary>
     public void Check(FactChecks checks)

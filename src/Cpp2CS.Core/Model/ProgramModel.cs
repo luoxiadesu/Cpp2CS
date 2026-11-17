@@ -173,6 +173,9 @@ public sealed class TypeDef
     public IReadOnlyList<MethodRef?> VTable { get; internal set; } = [];
     /// <summary>(接口, 起始槽位)。</summary>
     public IReadOnlyList<(TypeRef Interface, int Offset)> InterfaceOffsets { get; internal set; } = [];
+    /// <summary>元数据 rgctxEntries 中的一段 (种类, 数据)，方法或类型定义用 (RgctxStartIndex, RgctxCount) 指向它。</summary>
+    public int RgctxStartIndex { get; init; } = -1;
+    public int RgctxCount { get; init; }
 
     public bool IsInterface => (Attributes & TypeAttributes.Interface) != 0;
     /// <summary>C# 内建类型关键字（int、string……），其余为 null。</summary>
@@ -256,6 +259,13 @@ public sealed class MethodDef
     public IReadOnlyList<CustomAttributeDef> ReturnAttributes { get; internal set; } = [];
     /// <summary>非共享实现的代码地址（首选基址下的 VA）；0 表示无实现（抽象、extern 或仅有泛型实例）。</summary>
     public ulong Address { get; internal set; }
+    /// <summary>Il2CppMethodDefinition.methodIndex：全局方法入口表中的序号；-1 表示没有实现。</summary>
+    public int MethodIndex { get; init; } = -1;
+    /// <summary>Il2CppMethodDefinition.invokerIndex：调用器表中的序号；-1 表示没有。</summary>
+    public int InvokerIndex { get; init; } = -1;
+    /// <summary>元数据 rgctxEntries 中的一段 (种类, 数据)。</summary>
+    public int RgctxStartIndex { get; init; } = -1;
+    public int RgctxCount { get; init; }
 
     public bool IsStatic => (Attributes & MethodAttributes.Static) != 0;
     public bool IsVirtual => (Attributes & MethodAttributes.Virtual) != 0;
@@ -332,6 +342,19 @@ public sealed class ProgramModel
     public required IReadOnlyList<MethodRef> MethodSpecs { get; init; }
     public required IReadOnlyList<FieldRef> FieldRefs { get; init; }
     public required IReadOnlyList<string> StringLiterals { get; init; }
+    /// <summary>元数据 rgctxEntries 的原文：(种类, 数据)；数据为类型表序号或 methodSpec 序号。</summary>
+    public required IReadOnlyList<(Cpp2CS.Facts.RgctxKind Kind, int Data)> MetadataRgctxEntries { get; init; }
+    /// <summary>v24 的槽位地址 → 用途（来自 metadataUsageLists/Pairs）；v27+ 为空。</summary>
+    public IReadOnlyDictionary<ulong, Usage> MetadataUsages { get; internal set; } = new Dictionary<ulong, Usage>();
+    /// <summary>v24 元数据用途表：(槽位序号, 种类, 索引)；v27+ 为空。</summary>
+    public IReadOnlyList<(uint Destination, uint Kind, uint Index)> MetadataUsagePairs { get; init; } = [];
+    /// <summary>
+    /// v24 元数据用途区间：runtime 的 InitMetadata 实参是区间的下标，一次初始化该区间内的全部槽位。
+    /// 每项为区间在 <see cref="MetadataUsagePairs"/> 中的 (起点, 长度)；v27+ 为空。
+    /// </summary>
+    public IReadOnlyList<(uint Start, uint Count)> MetadataUsageLists { get; init; } = [];
+    /// <summary>v24 槽位序号 → 槽位地址（metadataRegistration.metadataUsages 表）；v27+ 为空。</summary>
+    public IReadOnlyList<ulong> UsageSlotAddresses { get; internal set; } = [];
     /// <summary>代码地址到托管所有者。</summary>
     public required IReadOnlyDictionary<ulong, IReadOnlyList<CodeOwner>> Code { get; init; }
     private readonly ConcurrentDictionary<ulong, Usage?> slots = new();
@@ -346,10 +369,34 @@ public sealed class ProgramModel
     }
 
     /// <summary>
-    /// 读取元数据槽位（v27+：全局变量初值为编码令牌 ((kind&lt;&lt;29)|(index&lt;&lt;1))+1）。
+    /// 读取元数据槽位。v27+：全局变量初值为编码令牌 ((kind&lt;&lt;29)|(index&lt;&lt;1))+1。
+    /// v24：槽位在 .bss，初值为 0；编码来自元数据 metadataUsagePairs，按槽位地址给出（见 <see cref="MetadataUsages"/>）。
     /// 编码不合法或索引越界返回 null。
     /// </summary>
-    public Usage? UsageAt(ulong slot) => slots.GetOrAdd(slot, DecodeSlot);
+    public Usage? UsageAt(ulong slot) => MetadataUsages.TryGetValue(slot, out var listed) ? listed : slots.GetOrAdd(slot, DecodeSlot);
+
+    /// <summary>
+    /// v24：InitMetadata 的下标形态。实参是 <see cref="MetadataUsageLists"/> 的下标时，返回该区间初始化到的槽位与用途；
+    /// 实参不是合法下标、该区间为空或任一目的槽位无法解码时为 null（调用方按其它形态处理）。
+    /// </summary>
+    public (ulong Slot, Usage Usage)[]? UsagesOfList(ulong index)
+    {
+        if (index >= (ulong)MetadataUsageLists.Count) return null;
+        var (start, count) = MetadataUsageLists[(int)index];
+        if (count == 0) return null;
+        var result = new List<(ulong, Usage)>((int)count);
+        for (var k = 0u; k < count; k++)
+        {
+            var pair = start + k;
+            if (pair >= MetadataUsagePairs.Count) return null;
+            var destination = MetadataUsagePairs[(int)pair].Destination;
+            if (destination >= UsageSlotAddresses.Count) return null;
+            var slot = UsageSlotAddresses[(int)destination];
+            if (UsageAt(slot) is not { } usage) return null;
+            result.Add((slot, usage));
+        }
+        return [.. result];
+    }
 
     private Usage? DecodeSlot(ulong slot)
     {

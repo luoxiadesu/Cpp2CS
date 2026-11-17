@@ -5,7 +5,7 @@ namespace Cpp2CS.Facts;
 /// 以托管代码的实际用法核验 <see cref="RuntimeLayout"/> 中的偏移：
 /// 1. 静态构造调用（ClassInit helper）之前读取 Il2CppClass.cctor_finished_or_no_cctor 并据此跳过；
 /// 2. 接口慢路径（InterfaceLookup）之前扫描 interface_offsets_count / interfaceOffsets；
-/// 3. 间接调用（BLR）的目标来自 vtable 槽（Il2CppClass+0x138+16n 的 methodPtr）、委托 invoke_impl，或其他来源（分别计数）。
+/// 3. 间接调用（BLR）的目标来自 vtable 槽（Il2CppClass+0x128+16n 的 methodPtr）、委托 invoke_impl，或其他来源（分别计数）。
 /// </summary>
 public static class LayoutChecks
 {

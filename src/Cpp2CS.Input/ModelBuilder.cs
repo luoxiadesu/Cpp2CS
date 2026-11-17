@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using Cpp2CS.Facts;
 using Cpp2CS.Image;
 using Cpp2CS.Model;
 using Il2CppDumper;
@@ -42,8 +43,12 @@ namespace Cpp2CS.Input
         private readonly TypeDef[] types;
         private readonly Dictionary<Il2CppType, TypeRef> converted = new(ReferenceEqualityComparer.Instance);
         private readonly Dictionary<int, GenericParameterDef> genericParameters = new();
+        private readonly List<string> problems = new();
 
         public Il2CppExecutor Executor => executor;
+
+        /// <summary>模型构建中无法解析、但不阻止继续建模的项。</summary>
+        public IReadOnlyList<string> Problems => problems;
 
         /// <summary>定位到的 Il2CppCodeRegistration / Il2CppMetadataRegistration 虚拟地址（已含 Il2CppDumper 的版本修正）。</summary>
         public ulong CodeRegistration { get; private init; }
@@ -141,6 +146,8 @@ namespace Cpp2CS.Input
                         IsEnum = def.IsEnum,
                         PackingSize = DecodePackingSize(def.bitfield),
                         ClassSizeIsDefault = ((def.bitfield >> 11) & 1) != 0,
+                        RgctxStartIndex = def.rgctxStartIndex,
+                        RgctxCount = def.rgctxCount,
                     };
                 }
             }
@@ -206,6 +213,10 @@ namespace Cpp2CS.Input
                         Slot = methodDef.slot == ushort.MaxValue ? -1 : methodDef.slot,
                         ReturnType = Convert(il2Cpp.types[methodDef.returnType]),
                         Address = il2Cpp.GetMethodPointer(type.Assembly, methodDef),
+                        MethodIndex = methodDef.methodIndex,
+                        InvokerIndex = methodDef.invokerIndex,
+                        RgctxStartIndex = methodDef.rgctxStartIndex,
+                        RgctxCount = methodDef.rgctxCount,
                     };
                     if (methodDef.genericContainerIndex >= 0) method.GenericParameters = GenericParameters(methodDef.genericContainerIndex);
                     var parameters = new ParameterDef[methodDef.parameterCount];
@@ -281,6 +292,14 @@ namespace Cpp2CS.Input
                 return new FieldRef(fields[metadata.typeDefs[definition.Index].fieldStart + r.fieldIndex], owner);
             }).ToArray();
             var literals = Enumerable.Range(0, metadata.stringLiterals.Length).Select(k => metadata.GetStringLiteralFromIndex((uint)k)).ToArray();
+            var rgctxEntries = metadata.Version <= 24.1 && metadata.rgctxEntries is { } entries
+                ? entries.Select(e => ((RgctxKind)e.type_pre29, e.data.rgctxDataDummy)).ToArray()
+                : (IReadOnlyList<(RgctxKind Kind, int Data)>)Array.Empty<(RgctxKind Kind, int Data)>();
+            // v24 元数据用途表：list 给出 pair 区间，pair 是 (槽位序号, 编码来源索引)。
+            // 编码来源索引的高 3 位是种类、低 29 位是索引（该版本不右移 1）。
+            var usageTables = metadata.Version <= 24.1 ? MetadataUsagePairs() : ([], []);
+            var usagePairs = usageTables.Item1;
+            var usageLists = usageTables.Item2;
 
             ReadInitialValues(fields);
 
@@ -315,6 +334,9 @@ namespace Cpp2CS.Input
                 MethodSpecs = methodSpecs,
                 FieldRefs = fieldRefs,
                 StringLiterals = literals,
+                MetadataRgctxEntries = rgctxEntries,
+                MetadataUsagePairs = usagePairs,
+                MetadataUsageLists = usageLists,
                 Code = CodeOwners(methods, methodSpecs),
             };
 
@@ -348,7 +370,8 @@ namespace Cpp2CS.Input
         /// <summary>Il2CppInterfaceOffsetPair { int32 interfaceTypeIndex; int32 offset; }，Il2CppDumper 未读取这张表。</summary>
         /// <summary>
         /// 公钥在字符串区按 blob 存放：压缩长度 + 原始字节（中间可能有 0，不能按字符串读）。
-        /// 用 SHA-1 末 8 字节倒序与元数据里的公钥标记核对。
+        /// 用 SHA-1 末 8 字节倒序与元数据里的公钥标记核对；不符说明该段被改写或剥离，
+        /// 按无公钥处理并保留诊断，不影响其余恢复。
         /// </summary>
         private byte[] PublicKey(Il2CppAssemblyNameDefinition name)
         {
@@ -356,7 +379,10 @@ namespace Cpp2CS.Input
             var key = metadata.ReadBytes((int)metadata.ReadCompressedUInt32());
             var token = key.Length == 0 ? new byte[8] : System.Security.Cryptography.SHA1.HashData(key)[^8..].Reverse().ToArray();
             if (!token.SequenceEqual(name.public_key_token))
-                throw new InvalidDataException($"{String(name.nameIndex)} 的公钥与公钥标记不符");
+            {
+                problems.Add($"{String(name.nameIndex)} 的公钥 blob 与公钥标记不符，按无公钥处理");
+                return [];
+            }
             return key;
         }
 
@@ -420,10 +446,11 @@ namespace Cpp2CS.Input
         /// <summary>
         /// v29+ 的自定义特性数据：每个 image 的 attributeDataRanges 按令牌给出数据区间，
         /// 区间内是 构造函数索引表 + 逐个特性的 (实参, 字段, 属性) 编码值。
+        /// v24：每个 image 的 attributeTypeRanges 按令牌给出 attributeTypes 中的一段类型索引，只有构造函数类型、
+        /// 没有实参编码；构造函数按该类型上 arity 为 0 的 .ctor 解析，解析不出的记诊断。
         /// </summary>
         private void ReadCustomAttributes(AssemblyDef[] assemblies, MethodDef[] methods, FieldDef[] fields, PropertyDef[] properties)
         {
-            if (metadata.Version < 29) throw new NotSupportedException($"元数据版本 {metadata.Version} 的特性由生成函数构造，尚未支持");
             var byToken = new Dictionary<uint, Action<IReadOnlyList<CustomAttributeDef>>>();
             for (var a = 0; a < assemblies.Length; a++)
             {
@@ -444,6 +471,11 @@ namespace Cpp2CS.Input
                     }
                     foreach (var property in type.Properties) byToken[property.Token] = list => property.CustomAttributes = list;
                     foreach (var definition in type.Events) byToken[definition.Token] = list => definition.CustomAttributes = list;
+                }
+                if (metadata.Version < 29)
+                {
+                    ReadTypeIndexAttributes(imageDef, byToken, assembly.Name);
+                    continue;
                 }
                 for (var r = imageDef.customAttributeStart; r < imageDef.customAttributeStart + imageDef.customAttributeCount; r++)
                 {
@@ -467,6 +499,55 @@ namespace Cpp2CS.Input
                     assign(list);
                 }
             }
+        }
+
+        /// <summary>v24 的特性：区间内是 Il2CppType 索引，构造函数取该类型上无参的实例 .ctor。</summary>
+        private void ReadTypeIndexAttributes(Il2CppImageDefinition imageDef, Dictionary<uint, Action<IReadOnlyList<CustomAttributeDef>>> byToken, string assembly)
+        {
+            for (var r = imageDef.customAttributeStart; r < imageDef.customAttributeStart + imageDef.customAttributeCount; r++)
+            {
+                var range = metadata.attributeTypeRanges[r];
+                var list = new List<CustomAttributeDef>();
+                for (var k = 0; k < range.count; k++)
+                {
+                    var typeIndex = metadata.attributeTypes[range.start + k];
+                    if (typeIndex < 0 || typeIndex >= il2Cpp.types.Length) { problems.Add($"{assembly} 特性类型序号越界 {typeIndex}"); continue; }
+                    if (Convert(il2Cpp.types[typeIndex]) is not DefinitionRef { Definition: var definition })
+                    { problems.Add($"{assembly} 特性 0x{range.token:x8} 的类型不是定义"); continue; }
+                    var constructor = definition.Methods.FirstOrDefault(m => m.Name == ".ctor" && !m.IsStatic && m.Parameters.Count == 0);
+                    if (constructor is null) { problems.Add($"{assembly} 特性类型 {definition.FullName} 没有无参构造函数"); continue; }
+                    list.Add(new CustomAttributeDef(constructor, [], [], []));
+                }
+                if (!byToken.TryGetValue(range.token, out var assign))
+                { problems.Add($"{assembly} 的特性令牌 0x{range.token:x8} 没有对应的元素"); continue; }
+                assign(list);
+            }
+        }
+
+        /// <summary>v24 的 metadataUsageLists/Pairs 展开为 (槽位序号, 种类, 索引)，并保留每个下标对应的 pair 区间。</summary>
+        private (IReadOnlyList<(uint Destination, uint Kind, uint Index)> Pairs, IReadOnlyList<(uint Start, uint Count)> Lists) MetadataUsagePairs()
+        {
+            var pairs = new List<(uint, uint, uint)>();
+            var lists = new List<(uint, uint)>();
+            var count = metadata.header.metadataUsagePairsCount / 8;
+            for (var i = 0; i < metadata.header.metadataUsageListsCount / 8; i++)
+            {
+                metadata.Position = (ulong)metadata.header.metadataUsageListsOffset + (ulong)i * 8;
+                var start = metadata.ReadUInt32();
+                var length = metadata.ReadUInt32();
+                // 区间按展开后的位置记录：展开保持原始顺序，但表本身不保证相邻，记录实际起点更稳妥。
+                lists.Add(((uint)pairs.Count, length));
+                for (var k = 0u; k < length; k++)
+                {
+                    var index = start + k;
+                    if (index >= count) { problems.Add($"元数据用途区间越界 {start}+{length}"); break; }
+                    metadata.Position = (ulong)metadata.header.metadataUsagePairsOffset + (ulong)index * 8;
+                    var destination = metadata.ReadUInt32();
+                    var encoded = metadata.ReadUInt32();
+                    pairs.Add((destination, encoded >> 29, encoded & 0x1FFFFFFF));
+                }
+            }
+            return (pairs, lists);
         }
 
         /// <summary>
@@ -589,8 +670,19 @@ namespace Cpp2CS.Input
         private TypeRef ConvertGenericInstance(Il2CppType type)
         {
             var genericClass = il2Cpp.MapVATR<Il2CppGenericClass>(type.data.generic_class);
-            var definition = Definition(Runtime(genericClass.type));
-            return new DefinitionRef(definition, Instantiation(genericClass.context.class_inst));
+            // v24：typeDefinitionIndex 指向类型定义；v27+：type 指向 Il2CppType。
+            // v24 中有少量泛型槽没有实例化定义（typeDefinitionIndex 为 -1），按未定义处理，记诊断。
+            if (metadata.Version < 27)
+            {
+                var index = genericClass.typeDefinitionIndex;
+                if (index < 0 || index >= types.Length)
+                {
+                    problems.Add($"泛型实例的类型定义索引无效 {index}，按 System.Object 占位");
+                    return Corlib("System.Object");
+                }
+                return new DefinitionRef(types[index], Instantiation(genericClass.context.class_inst));
+            }
+            return new DefinitionRef(Definition(Runtime(genericClass.type)), Instantiation(genericClass.context.class_inst));
         }
 
         private TypeRef ConvertGenericParameter(Il2CppType type)

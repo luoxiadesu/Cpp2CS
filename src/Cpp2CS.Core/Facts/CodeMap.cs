@@ -194,11 +194,22 @@ public sealed class CodeMap
                     if (owner < 0 || !list[owner].Contains(target)) Candidate(target, "b");
                 }
                 else if (A64.IsAdr(w)) Candidate(A64.AdrTarget(w, pc), "adr");
-                else if (A64.IsAdrp(w) && offset + 8 <= span.Length)
+                else if (A64.IsAdrp(w))
                 {
-                    var next = BinaryPrimitives.ReadUInt32LittleEndian(span[(offset + 4)..]);
-                    if (A64.IsAddImmediate64(next) && A64.Rn(next) == A64.Rd(w))
-                        Candidate(A64.AdrpPage(w, pc) + A64.AddImmediate(next), "adrp+add");
+                    // ADRP 与配对的 ADD 之间可以插入无关指令（编译器在页内偏移计算前后穿插其他运算），
+                    // 在窗口内找第一条以同一寄存器为基址的 ADD。
+                    var page = A64.AdrpPage(w, pc);
+                    for (var k = 4; k <= 16 && offset + k + 4 <= span.Length; k += 4)
+                    {
+                        var next = BinaryPrimitives.ReadUInt32LittleEndian(span[(offset + k)..]);
+                        if (A64.IsAddImmediate64(next) && A64.Rn(next) == A64.Rd(w))
+                        {
+                            Candidate(page + A64.AddImmediate(next), "adrp+add");
+                            break;
+                        }
+                        // 目标寄存器被其他写指令覆盖后不再构成配对。
+                        if (A64.MayWriteRd(next) && A64.Rd(next) == A64.Rd(w)) break;
+                    }
                 }
             }
         }
@@ -226,9 +237,13 @@ public sealed class CodeMap
         {
             var words = new List<uint>();
             for (var pc = start; pc + 4 <= end; pc += 4) words.Add(Raw(pc));
+            // 没有任何引用落入的未覆盖区间是编译器留下的不可达代码块（死代码、冷分区孤立块），
+            // 与被引用却缺少 FDE 的入口区分开：后者由 referenced-without-fde 单独报告。
+            var unreferenced = !referenced.Keys.Any(a => a >= start && a < end);
             var kind = Enumerable.Range(0, words.Count).All(k => stubs.Contains(start + 4UL * (ulong)k)) ? "erratum-stubs"
                 : words.All(w => w == A64.Nop || A64.IsTrap(w)) ? "padding"
                 : Enumerable.Range(0, words.Count).All(k => stubs.Contains(start + 4UL * (ulong)k) || words[k] == A64.Nop || A64.IsTrap(words[k])) ? "erratum-stubs+padding"
+                : unreferenced ? "unreferenced-code"
                 : "unexplained";
             gaps.Add(new(start, end, kind));
         }

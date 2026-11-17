@@ -29,11 +29,6 @@ internal static class IndirectPass
             op = new RuntimeOp(OpKind.CallInterface, operand);
             template = Template.InterfaceCall;
         }
-        else if (rest is [Use { Variable: var resolvedMethod }] && constant == RuntimeLayout.MethodVirtualPointer && state.genericVirtual.TryGetValue(resolvedMethod, out var gvm))
-        {
-            op = new RuntimeOp(OpKind.CallGenericVirtual, gvm);
-            template = Template.GenericVirtualCall;
-        }
         else if (rest.Count == 1 && constant == RuntimeLayout.DelegateInvokeImpl)
         {
             op = new RuntimeOp(OpKind.CallDelegate, null);
