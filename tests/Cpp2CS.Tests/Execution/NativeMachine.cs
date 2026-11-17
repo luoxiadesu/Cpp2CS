@@ -418,13 +418,27 @@ internal sealed partial class NativeMachine : IDisposable
         {
             case HelperKind.InitMetadata:
             {
+                // v24 的实参是元数据用途区间的下标，一次初始化该区间的全部槽位，初始化后返回 0；
+                // v27+ 的实参是槽位地址本身，返回槽位的值。
+                if (facts.Model.UsagesOfList(X(0)) is { } group)
+                {
+                    Span<byte> bytes = stackalloc byte[8];
+                    foreach (var (groupSlot, groupUsage) in group)
+                    {
+                        SaveImage(groupSlot, 8);
+                        BinaryPrimitives.WriteUInt64LittleEndian(bytes, world.SlotValue(groupUsage));
+                        uc.Write(groupSlot, bytes);
+                    }
+                    Result(0);
+                    break;
+                }
                 var slot = X(0);
-                var usage = facts.Usages.At(slot)?.Usage ?? throw new Unsupported($"0x{slot:x} 不是元数据槽位");
+                var usage = facts.Usages.At(slot)?.Usage ?? throw new Unsupported($"0x{slot:x} 不是元数据槽位或用途区间");
                 var value = world.SlotValue(usage);
                 SaveImage(slot, 8);
-                Span<byte> bytes = stackalloc byte[8];
-                BinaryPrimitives.WriteUInt64LittleEndian(bytes, value);
-                uc.Write(slot, bytes);
+                Span<byte> single = stackalloc byte[8];
+                BinaryPrimitives.WriteUInt64LittleEndian(single, value);
+                uc.Write(slot, single);
                 Result(value);
                 break;
             }

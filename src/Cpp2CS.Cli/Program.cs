@@ -27,6 +27,8 @@ internal static class Program
             ["inspect", var binary, var metadata, .. var options] when options.Length > 0 => Inspect.Run(binary, metadata, options),
             ["source-project", var assembly, var output] => SourceProject(assembly, output),
             ["holes", var run, .. var options] => HoleCensus.Run(run, options),
+            ["callers", var binary, var metadata, var range, .. var options] => Callers(binary, metadata, range, options),
+            ["eh", var binary, var metadata, .. var entries] when entries.Length > 0 => Eh(binary, metadata, entries),
             _ => Usage(),
         };
     }
@@ -95,7 +97,7 @@ internal static class Program
 
     private static int Ssa(string binary, string metadata, ulong[] entries, bool idioms, string[] options)
     {
-        var facts = FactsBuilder.Build(binary, metadata, options: CacheOptions(options));
+        var facts = FactsBuilder.Build(binary, metadata, options: CacheOptions(options), inferUnregistered: !options.Contains("--no-infer"));
         var lifter = new Cpp2CS.Machine.Lifting.FunctionLifter(facts);
         var rewriter = new Cpp2CS.Idioms.IdiomRewriter(facts);
         foreach (var entry in entries)
@@ -140,23 +142,201 @@ internal static class Program
         return 0;
     }
 
-    /// <summary>按全名查找类型（非泛型定义按 FullName，泛型实例按运行时类型的显示名）并打印布局。</summary>
+    /// <summary>
+    /// 打印函数（或包含该地址的函数）的 LSDA 区间、action 链与类型槽，用于核对异常事实。
+    /// --scan：汇总全部托管 LSDA action 的类别、序号与类型名分布。
+    /// </summary>
+    private static int Eh(string binary, string metadata, string[] entries)
+    {
+        var facts = FactsBuilder.Build(binary, metadata, inferUnregistered: false, options: CacheOptions(entries));
+        if (entries.Contains("--scan"))
+        {
+            var groups = new Dictionary<string, int>();
+            var names = new Dictionary<string, int>();
+            var indices = new Dictionary<(string Kind, long Filter, bool Null), int>();
+            var typed = new Dictionary<(long Filter, string Name), int>();
+            foreach (var function in facts.Code.Functions.Where(f => f.Region == CodeRegion.Managed))
+                foreach (var region in function.ExceptionRegions)
+                    foreach (var action in region.Actions)
+                    {
+                        var slot = action.TypeInfo ?? 0;
+                        // 类型槽存的是重定位后的 typeinfo 指针；名字在 typeinfo+8。
+                        var typeInfo = slot is > 0 ? facts.Model.Image.RelocatedPointer(slot) : null;
+                        var name = typeInfo is { } pointer && pointer != 0 ? ExceptionFacts.TypeName(facts.Model.Image, pointer) ?? "（未解析）" : "（空槽）";
+                        var key = (action.Kind, action.Filter, slot == 0);
+                        indices[key] = indices.GetValueOrDefault(key) + 1;
+                        groups[action.Kind] = groups.GetValueOrDefault(action.Kind) + 1;
+                        names[name] = names.GetValueOrDefault(name) + 1;
+                        if (slot != 0) typed[(action.Filter, name)] = typed.GetValueOrDefault((action.Filter, name)) + 1;
+                    }
+            Console.WriteLine("按类别：" + string.Join("，", groups.OrderByDescending(p => p.Value).Select(p => $"{p.Key}={p.Value}")));
+            Console.WriteLine("按（类别，序号，槽为空）：");
+            foreach (var (key, count) in indices.OrderByDescending(p => p.Value))
+                Console.WriteLine($"  {key.Kind} filter={key.Filter} 空槽={key.Null}: {count}");
+            Console.WriteLine("非空类型槽按（序号，类型名）：");
+            foreach (var (key, count) in typed.OrderByDescending(p => p.Value))
+                Console.WriteLine($"  filter={key.Filter} {key.Name}: {count}");
+            Console.WriteLine("按类型名：" + string.Join("，", names.OrderByDescending(p => p.Value).Take(20).Select(p => $"{p.Key}={p.Value}")));
+            // 抛出点按实参形态的证据：列出抛出点所属函数与调用目标，核对是否集中在少数 helper。
+            var throws = ExceptionFacts.Throws(facts.Code, facts.Scan, facts.Helpers);
+            var sites = facts.Scan.All.ToDictionary(r => r.Site, r => r.Target);
+            var targets = throws.GroupBy(t => sites.GetValueOrDefault(t.Site))
+                .OrderByDescending(g => g.Count()).ToArray();
+            Console.WriteLine($"抛出点 {throws.Length} 处，按调用目标：");
+            foreach (var group in targets.Take(12))
+                Console.WriteLine($"  0x{group.Key:x} {group.Count()} 处，函数 {group.Select(t => $"0x{t.Entry:x}").Distinct().Count()} 个" +
+                    $"（{(facts.Helpers.At(group.Key)?.ToString() ?? "无 helper 证据")}）");
+            // 每个（序号，空槽）组合给出若干函数入口，便于逐点核对类型表。
+            var samples = new Dictionary<(long Filter, bool Null), List<ulong>>();
+            foreach (var function in facts.Code.Functions.Where(f => f.Region == CodeRegion.Managed))
+                foreach (var region in function.ExceptionRegions)
+                    foreach (var action in region.Actions.Where(a => a.Filter > 0))
+                    {
+                        var key = (action.Filter, (action.TypeInfo ?? 0) == 0);
+                        if (!samples.TryGetValue(key, out var list)) samples[key] = list = [];
+                        if (list.Count < 4 && !list.Contains(function.Start)) list.Add(function.Start);
+                    }
+            foreach (var (key, list) in samples.OrderByDescending(p => p.Value.Count))
+                Console.WriteLine($"样例 filter={key.Filter} 空槽={key.Null}：" + string.Join("，", list.Select(a => $"0x{a:x}")));
+            return 0;
+        }
+        var addresses = entries.Where(e => e.StartsWith("0x", StringComparison.Ordinal)).Select(e => Convert.ToUInt64(e[2..], 16)).ToArray();
+        // --helpers：打印给定地址作为 helper 的识别结果与依据（含内部调用）。
+        if (entries.Length == 1 || entries.Contains("--helpers"))
+        {
+            foreach (var address in addresses)
+            {
+                var helper = facts.Helpers.At(address);
+                var internalCall = facts.Helpers.InternalCall(address);
+                Console.WriteLine($"0x{address:x} 表内：{helper?.Kind.ToString() ?? "无"} {helper?.Evidence}");
+                Console.WriteLine($"0x{address:x} 内部：{internalCall.Kind} {internalCall.Detail} — {internalCall.Evidence}");
+                // 判据分解：类初始化本体依赖的几项形态各自是否成立。
+                var function = facts.Code.At(address);
+                if (function is not null)
+                {
+                    int Count(Func<uint, bool> predicate)
+                    {
+                        var n = 0;
+                        for (var pc = function.Start; pc < function.End; pc += 4) if (facts.Code.Word(pc) is { } w && predicate(w)) n++;
+                        return n;
+                    }
+                    Console.WriteLine($"  原子 {Count(w => (w & 0x3FE0FC00) is 0x085FFC00 or 0x0809FC00 or 0x081FFC00 or 0x080DFC00)} 条，" +
+                        $"add #0xd8 {Count(w => (w & 0xFF800000) == 0x91000000 && ((w >> 10) & 0xFFF) == 0xD8)} 条，" +
+                        $"add #0xd4 {Count(w => (w & 0xFF800000) == 0x91000000 && ((w >> 10) & 0xFFF) == 0xD4)} 条");
+                    for (var pc = function.Start; pc < function.End; pc += 4)
+                        if (facts.Code.Word(pc) is { } w && (w & 0x3B000000) == 0x39000000 && ((w >> 22) & 3) != 0)
+                            Console.WriteLine($"  读 [x{(w >> 5) & 31}, #0x{((w >> 10) & 0xFFF) * (1 << (int)(w >> 30)):x}] 宽 {1 << (int)(w >> 30)} @0x{pc:x}");
+                }
+            }
+        }
+        // --cxa：打印静态链接 __cxa_throw 的识别结果与函数边界，核对常量链扫描。
+        if (entries.Contains("--cxa"))
+        {
+            var found = new List<(ulong Start, ulong End)>();
+            foreach (var function in facts.Code.Functions.Where(f => f.Region is CodeRegion.Runtime or CodeRegion.Managed))
+            {
+                for (var pc = function.Start; pc + 4 <= function.End; pc += 4)
+                    if (facts.Code.Word(pc) is { } w && (w & 0x7F800000) == 0x52800000 && (w & 0x80000000) != 0
+                        && ((w >> 5) & 0xFFFF) == 0x2B00 && ((w >> 21) & 3) == 0)
+                    { found.Add((function.Start, pc)); break; }
+            }
+            Console.WriteLine($"MOVZ 低 16 位 0x2b00 的函数 {found.Count} 个");
+            foreach (var (start, pc) in found.Take(10))
+                Console.WriteLine($"  函数 0x{start:x} 首条 0x{pc:x}");
+            if (facts.Code.At(0x142d9bc) is { } owner)
+            {
+                Console.WriteLine($"0x142d9bc 属于函数 0x{owner.Start:x}..0x{owner.End:x} {owner.Region}/{owner.Evidence}");
+                for (var pc = 0x142da10UL; pc <= 0x142da2c; pc += 4)
+                {
+                    var w = facts.Code.Word(pc);
+                    Console.WriteLine($"  0x{pc:x} word={(w is { } x ? x.ToString("x8") : "无")}" +
+                        (w is { } y ? $" imm16=0x{(y >> 5) & 0xFFFF:x} shift={(y >> 21) & 3}" : ""));
+                }
+                var callsInto = facts.Scan.Of(facts.Code.EntryIndex(0x142d9bc)).ToArray()
+                    .Where(r => r.Kind is RefKind.Call or RefKind.TailCall).Select(r => r.Target).Distinct().Take(6).ToArray();
+                Console.WriteLine("  该函数调用的目标：" + string.Join("，", callsInto.Select(a => $"0x{a:x}")));
+                Console.WriteLine($"  以 0xfde220 为目标的调用点 {facts.Scan.All.Count(r => r.Target == 0xfde220)} 处");
+            }
+        }
+        foreach (var address in addresses)
+        {
+            var function = facts.Code.At(address);
+            if (function is null) { Console.WriteLine($"0x{address:x} 不在任何函数内"); continue; }
+            Console.WriteLine($"函数 0x{function.Start:x}..0x{function.End:x} {function.Region} LSDA 区间 {function.ExceptionRegions.Length} 个");
+            foreach (var region in function.ExceptionRegions)
+            {
+                Console.WriteLine($"  0x{region.Start:x}..0x{region.End:x} 落地 0x{region.LandingPad:x} actionOffset {region.ActionOffset}");
+                foreach (var action in region.Actions)
+                {
+                    // 类型槽存的是重定位后的 typeinfo 指针；名字在 typeinfo+8。
+                    var typeInfo = action.TypeInfo is { } slot && slot != 0 ? facts.Model.Image.RelocatedPointer(slot) : null;
+                    var name = typeInfo is { } pointer && pointer != 0 ? ExceptionFacts.TypeName(facts.Model.Image, pointer) ?? "（未解析）" : "（空槽）";
+                    Console.WriteLine($"    @0x{action.Address:x} filter={action.Filter} next={action.NextOffset} {action.Kind} " +
+                        $"槽=0x{action.TypeInfo:x} 重定位=0x{typeInfo:x} 名={name}");
+                }
+            }
+        }
+        return 0;
+    }
+
+    /// <summary>按全名查找类型（非泛型定义按 FullName，泛型实例按运行时类型的显示名）并打印布局。
+    /// --algorithm：同时打印不采用元数据值的算法重算结果，用于核对 layout.instance-fields。
+    /// </summary>
     private static int Layout(string binary, string metadata, string name, string[] options)
     {
-        var facts = FactsBuilder.Build(binary, metadata, options: CacheOptions(options));
+        var facts = FactsBuilder.Build(binary, metadata, inferUnregistered: false, options: CacheOptions(options));
+        var algorithm = options.Contains("--algorithm");
         var matches = facts.Model.Types.Where(t => t.FullName == name && t.GenericParameters.Count == 0).Select(t => new Model.DefinitionRef(t, []))
             .Concat(facts.Model.RuntimeTypes.OfType<Model.DefinitionRef>().Where(d => d.Arguments.Count > 0 && d.ToString() == name)).Distinct().ToArray();
         if (matches.Length == 0) { Console.Error.WriteLine($"没有名为 {name} 的封闭类型"); return 1; }
         foreach (var type in matches)
         {
             var layout = facts.Layouts.Of(type);
+            var computed = algorithm ? facts.Layouts.Compute(type) : null;
             if (layout is null) { Console.WriteLine($"{type}: 没有运行时布局"); continue; }
             Console.WriteLine($"{type}  instance_size=0x{layout.InstanceSize:x} actualSize=0x{layout.ActualSize:x} minimumAlignment={layout.MinimumAlignment} " +
-                $"has_references={layout.HasReferences} {(layout.FromMetadata ? "（元数据）" : "（按运行时算法）")}");
-            foreach (var f in layout.Fields) Console.WriteLine($"  +0x{f.Offset:x3} {f.Type} {f.Field.Name}");
+                $"has_references={layout.HasReferences} {(layout.FromMetadata ? "（元数据）" : "（按运行时算法）")} " +
+                $"元数据大小={(type.Definition.Size < 0 ? "未知" : $"0x{type.Definition.Size:x}")} packing={type.Definition.PackingSize} classSizeDefault={type.Definition.ClassSizeIsDefault}");
+            if (computed is { } c)
+                Console.WriteLine($"  算法：instance_size=0x{c.InstanceSize:x} actualSize=0x{c.ActualSize:x} minimumAlignment={c.MinimumAlignment} has_references={c.HasReferences}");
+            var algorithmOffsets = computed?.Fields.ToDictionary(f => f.Field, f => f.Offset);
+            foreach (var f in layout.Fields)
+                Console.WriteLine($"  +0x{f.Offset:x3} {f.Type} {f.Field.Name}" +
+                    (algorithmOffsets is { } offsets && offsets.TryGetValue(f.Field, out var a) ? $"（算法 0x{a:x}，原始偏移 {f.Field.Offset}）" : ""));
             foreach (var f in layout.Statics) Console.WriteLine($"  static +0x{f.Offset:x3} {f.Type} {f.Field.Name}");
             foreach (var f in layout.ThreadStatics) Console.WriteLine($"  threadstatic +0x{f.Offset:x3} {f.Type} {f.Field.Name}");
             foreach (var m in type.Definition.Methods) Console.WriteLine($"  method 0x{m.Address:x} {m.Name}({string.Join(", ", m.Parameters.Select(p => p.Type))}) : {m.ReturnType}");
+        }
+        return 0;
+    }
+
+    /// <summary>按未注册推断的调用者顺序（<see cref="CodeScan.All"/> 中首次出现）列出调用者及其调用点数，用于定位长耗时函数。</summary>
+    private static int Callers(string binary, string metadata, string range, string[] options)
+    {
+        var parts = range.Split("..", StringSplitOptions.None);
+        var from = int.Parse(parts[0]);
+        var to = parts.Length > 1 ? int.Parse(parts[1]) : from;
+        var facts = FactsBuilder.Build(binary, metadata, inferUnregistered: false, options: CacheOptions(options));
+        if (options.Contains("--checks"))
+        {
+            foreach (var check in facts.Checks.All)
+            {
+                var mark = check.Severity == "Info" ? "  " : check.Passed ? "✓ " : check.Severity == "Error" ? "✗ " : "! ";
+                Console.WriteLine($"{mark}{check.Name}: {check.Violations}/{check.Total} — {check.Detail}");
+                foreach (var sample in check.Samples) Console.WriteLine($"      {sample}");
+            }
+            return 0;
+        }
+        var unregistered = facts.Code.Functions.Where(f => f.Region == CodeRegion.Managed && facts.EntriesAt(f.Start).Length == 0).ToDictionary(f => f.Start);
+        var groups = facts.Scan.All.Where(r => r.Kind is RefKind.Call or RefKind.TailCall && unregistered.ContainsKey(r.Target))
+            .GroupBy(r => facts.Code.At(r.Site)!.Start).ToArray();
+        Console.WriteLine($"调用者 {groups.Length}");
+        for (var i = Math.Max(1, from); i <= Math.Min(groups.Length, to); i++)
+        {
+            var group = groups[i - 1];
+            var function = facts.Code.At(group.Key)!;
+            var size = function.End - function.Start;
+            Console.WriteLine($"{i}\t0x{group.Key:x}\t{size} 字节\t{group.Count()} 调用点\t{string.Join(" | ", facts.EntriesAt(group.Key).Select(e => e.Method?.ToString() ?? e.Kind.ToString()).DefaultIfEmpty("无注册入口"))}");
         }
         return 0;
     }
