@@ -17,6 +17,13 @@ internal static class ClassInitializationFlags
             && (IsBitTest(binary.Left, load) || IsBitTest(binary.Right, load));
     }
 
+    /// <summary>该读取的每处使用都被同一掩码覆盖，其他位不参与条件。</summary>
+    internal static bool UsesOnlyMask(Expr condition, Load load, ulong expectedMask)
+    {
+        var masked = ExprMap.Map(condition, e => MaskedLoad(e, load, out var bits) && bits == expectedMask ? Expr.C(0, e.Width) : null);
+        return !ExprMap.Walk(masked).Contains(load);
+    }
+
     private static bool IsDirectBitTest(Expr condition, Load load)
     {
         if (load.Width is not (8 or 16) || condition is not Compare
@@ -24,14 +31,24 @@ internal static class ClassInitializationFlags
                 Cond: Cond.Eq or Cond.Ne, Right: Const { Value: 0 },
                 Left: Binary { Op: BinOp.And } mask
             }) return false;
-        Expr Low(Expr value) => value switch
+        return MaskedLoad(mask, load, out var bits) && bits != 0 && (bits & (bits - 1)) == 0;
+    }
+
+    private static bool MaskedLoad(Expr value, Load load, out ulong bits)
+    {
+        bits = 0;
+        if (value is not Binary { Op: BinOp.And } mask) return false;
+        Expr operand;
+        if (mask.Right is Const right) { operand = mask.Left; bits = right.Value; }
+        else if (mask.Left is Const left) { operand = mask.Right; bits = left.Value; }
+        else return false;
+        Expr Low(Expr part) => part switch
         {
             Ir.Convert c => Low(c.Operand),
             Extract { Low: 0 } e => Low(e.Operand),
-            _ => value,
+            _ => part,
         };
-        var (operand, bits) = mask.Right is Const right ? (mask.Left, right.Value) : (mask.Right, ((Const)mask.Left).Value);
-        return bits != 0 && (bits & (bits - 1)) == 0 && Low(operand) == load;
+        return Low(operand) == load;
     }
 
     internal static bool IsReload(Expr value, Load load) => value == load

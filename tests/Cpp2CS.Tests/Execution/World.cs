@@ -402,7 +402,7 @@ internal sealed partial class World
             if (layout.HasReferences) flags1 |= 0x20;
             Put8(klass + RuntimeLayout.ClassBitflags1, flags1);
         }
-        Put8(klass + RuntimeLayout.ClassBitflags2, 0x21);
+        Put8(klass + RuntimeLayout.ClassBitflags2, (byte)(0x21 | (definition?.Definition.Methods.Any(m => m.Name == ".cctor") == true ? RuntimeLayout.ClassHasCctorMask : 0)));
         Put16(klass + RuntimeLayout.ClassVtableCount, (ushort)vtable.Count);
         var chain = Reserve(hierarchy.Count * 8, 8);
         for (var i = 0; i < hierarchy.Count; i++) Put64(chain + (ulong)(i * 8), hierarchy[i].Equals(type) ? klass : Klass(hierarchy[i]));

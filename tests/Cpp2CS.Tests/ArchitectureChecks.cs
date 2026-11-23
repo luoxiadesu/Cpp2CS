@@ -32,10 +32,6 @@ internal static class ArchitectureChecks
         var facts = FactsBuilder.Build(binary, metadata, options: new RecoveryOptions { FactCacheFile = Path.GetFullPath(cache) });
         var types = new ManagedTypes(facts.Model, facts.Layouts);
         var checks = new Assertions();
-        var sharedReference = facts.Model.RuntimeTypes.OfType<DefinitionRef>().First(d => !d.Definition.IsValueType && FieldLayouts.IsFullyShared(d));
-        var referenceShape = new Aapcs64Classifier(facts.Layouts).Describe(sharedReference);
-        checks.True(referenceShape.Kind == Aapcs64Classifier.Kind.Pointer && referenceShape.Size == 8,
-            "含共享类型参数的引用仍按 AAPCS64 指针传递");
         // 环境变量 CHECKS_ONLY 给出逗号分隔的检查方法名时只运行这些检查（定向验证用）。
         if (Environment.GetEnvironmentVariable("CHECKS_ONLY") is { Length: > 0 } only)
         {
@@ -48,6 +44,10 @@ internal static class ArchitectureChecks
             }
             return checks.Finish("架构边界");
         }
+        var sharedReference = facts.Model.RuntimeTypes.OfType<DefinitionRef>().First(d => !d.Definition.IsValueType && FieldLayouts.IsFullyShared(d));
+        var referenceShape = new Aapcs64Classifier(facts.Layouts).Describe(sharedReference);
+        checks.True(referenceShape.Kind == Aapcs64Classifier.Kind.Pointer && referenceShape.Size == 8,
+            "含共享类型参数的引用仍按 AAPCS64 指针传递");
         Convergence(checks, types);
         Identities(checks, types);
         CallIdentities(checks);
@@ -62,6 +62,8 @@ internal static class ArchitectureChecks
         PlatformInvokeDeclarations(checks, facts, types);
         StackBoxes(checks, facts, types);
         ExceptionStacks(checks, facts);
+        ExceptionPayloads(checks);
+        ConstructorGuards(checks, facts);
         FieldAvailability(checks, types);
         PartialScalarCells(checks, facts, types);
         UnusedCallStacks(checks, facts, types);
@@ -248,6 +250,69 @@ internal static class ArchitectureChecks
         check.True(!Holds(Body(To(1, 2, Zero(Field(0)), new ManagedStore(1, Field(0), new ConstantValue(1, types.Int32, 32)), Const(1)), End(2)), saved.Variable, 2), "字段已改写成别的常量时不相等");
         check.True(!Holds(Body(To(1, 2, Zero(Field(0)), call, Const(1)), End(2)), saved.Variable, 2), "调用之后不再知道字段的内容");
         check.True(Holds(Body(new(1, [branch]), To(2, 4, Read(2)), To(3, 4, Zero(Field(0)), Const(3)), End(4)), saved.Variable, 4), "读取与常量写入汇合后仍等于该字段");
+    }
+
+    private static void ConstructorGuards(Assertions check, ProgramFacts facts)
+    {
+        var helper = facts.Helpers.Helpers.Values.First(h => h.Kind == HelperKind.ClassInit).Address;
+        var type = new GenericParameterRef("T", true, 0);
+        var klass = new Symbol(SymbolKind.Class, type);
+        Expr Field(int offset, int width) => new Load(new Binary(BinOp.Add, klass, Expr.C((ulong)offset, 64), 64), width);
+        bool Recognizes(int mask, bool has, bool done, bool reverse, bool single = false, bool extraBit = false, bool wide = false)
+        {
+            var flagLoad = Field(wide ? RuntimeLayout.ClassBitflags1 : RuntimeLayout.ClassBitflags2, wide ? 16 : 8);
+            var flags = new Compare(has ? Cond.Ne : Cond.Eq,
+                new Binary(BinOp.And, flagLoad, Expr.C((ulong)mask, flagLoad.Width), flagLoad.Width), Expr.C(0, flagLoad.Width));
+            var finished = new Compare(done ? Cond.Ne : Cond.Eq, Field(RuntimeLayout.ClassCctorFinishedOrNoCctor, 32), Expr.C(0, 32));
+            Expr condition = single ? finished : new Binary(BinOp.And, flags, finished, 32);
+            if (extraBit) condition = new Binary(BinOp.And, condition, new Compare(Cond.Eq,
+                new Binary(BinOp.And, Field(RuntimeLayout.ClassBitflags2, 8), Expr.C(8, 8), 8), Expr.C(0, 8)), 32);
+            if (reverse) condition = new Compare(Cond.Eq, condition, Expr.C(0, condition.Width));
+            var head = new Block(0) { Statements = [new Branch(0, condition, reverse ? 32UL : 16UL, reverse ? 16UL : 32UL)] };
+            var initialize = new Block(16) { Statements = [new Call(16, CallKind.Direct, Expr.C(helper, 64)) { Arguments = [klass], Sources = [Storage.Gpr(0)] }, new Jump(20, 32)] };
+            var merge = new Block(32) { Statements = [new Return(32)] };
+            MachineFunction.AddEdge(head, reverse ? merge : initialize);
+            MachineFunction.AddEdge(head, reverse ? initialize : merge);
+            MachineFunction.AddEdge(initialize, merge);
+            var function = new MachineFunction { Entry = 0, Range = new(0, 36, CodeRegion.Managed, default), Blocks = [head, initialize, merge] };
+            function.Renumber();
+            new IdiomState(new IdiomRewriter(facts), function).Guards();
+            return head.Statements.OfType<Call>().Any(c => c.Op?.Kind == OpKind.RunClassConstructor);
+        }
+        foreach (var mask in new[] { (int)RuntimeLayout.ClassHasCctorMask, 8 })
+            foreach (var has in new[] { false, true })
+                foreach (var done in new[] { false, true })
+                    foreach (var reverse in new[] { false, true })
+                        check.Equal(mask == RuntimeLayout.ClassHasCctorMask && has && !done, Recognizes(mask, has, done, reverse),
+                            $"静态构造守卫核对标志掩码、完成状态与分支方向 {mask}/{has}/{done}/{reverse}");
+        foreach (var has in new[] { false, true })
+            foreach (var done in new[] { false, true })
+                foreach (var reverse in new[] { false, true })
+                    check.Equal(has && !done, Recognizes(RuntimeLayout.ClassHasCctorMask << 8, has, done, reverse, wide: true),
+                        $"跨两字节读取的同一静态构造位 {has}/{done}/{reverse}");
+        check.True(Recognizes(2, true, false, false, single: true), "单独的未完成检查仍是静态构造守卫");
+        check.True(!Recognizes(2, true, true, false, single: true), "完成后才调用的反向判断不是静态构造守卫");
+        check.True(!Recognizes(2, true, false, false, extraBit: true), "同一标志字节的其他位也参与条件时不能折叠");
+    }
+
+    private static void ExceptionPayloads(Assertions check)
+    {
+        static Expr R(int register, int width = 64) => new Read(Storage.Gpr(register), width);
+        Stmt[] Body(Expr value, params Stmt[] between) =>
+        [
+            new Assign(0, Storage.Gpr(19), R(0)),
+            new Call(4, CallKind.Direct, Expr.C(80, 64)),
+            new Store(8, R(0), value),
+            .. between,
+            new Call(20, CallKind.Direct, Expr.C(84, 64)),
+        ];
+        check.True(RuntimeHelpers.ForwardsExceptionObject(Body(R(19)), 20), "异常 wrapper 的载荷来自非易失寄存器保存的入口对象");
+        check.True(!RuntimeHelpers.ForwardsExceptionObject(Body(R(1)), 20), "调用破坏的寄存器不能证明异常对象来源");
+        check.True(!RuntimeHelpers.ForwardsExceptionObject(Body(R(19, 32)), 20), "截断的对象指针不能作为完整异常载荷");
+        check.True(!RuntimeHelpers.ForwardsExceptionObject(Body(R(19), new Call(12, CallKind.Direct, Expr.C(88, 64))), 20), "载荷写入后再次调用会使内存证明失效");
+        check.True(!RuntimeHelpers.ForwardsExceptionObject(Body(R(19), new Store(12, R(0), Expr.C(0, 64))), 20), "覆盖载荷后不能沿用原异常对象");
+        check.True(!RuntimeHelpers.ForwardsExceptionObject(Body(R(19), new Assign(12, Storage.Gpr(0), R(19))), 20), "抛出对象地址必须仍为已写入的 wrapper 地址");
+        check.True(!RuntimeHelpers.ForwardsExceptionObject(Body(R(19), new Branch(12, Expr.C(1, 1), 20, 16)), 20), "未证明的分支不能作为直线抛出包装");
     }
 
     private static void ExceptionStacks(Assertions check, ProgramFacts facts)

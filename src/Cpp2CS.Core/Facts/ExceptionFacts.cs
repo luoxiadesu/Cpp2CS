@@ -4,7 +4,7 @@ using Cpp2CS.Ir;
 
 namespace Cpp2CS.Facts;
 
-/// <summary>F5 的全程序异常事实。只增加检查；不改变 helper 分类、异常边或恢复判定。</summary>
+/// <summary>全程序异常事实；逐点核验的 wrapper 抛出实参同时作为 helper 识别的依据。</summary>
 public static class ExceptionFacts
 {
     public const string WrapperName = "22Il2CppExceptionWrapper";
@@ -88,7 +88,7 @@ public static class ExceptionFacts
     /// __cxa_throw 的目标优先按符号确定；样本静态链接该函数、符号名丢失时，
     /// 按函数体内的 exception_class 常量（"GNUCC++"）认定实现，并由其 PLT 桩的 RELATIVE 重定位把调用点接回来。
     /// </summary>
-    public static ThrowSite[] Throws(CodeMap map, CodeScan scan, RuntimeHelpers helpers)
+    public static ThrowSite[] Throws(CodeMap map, CodeScan scan, RuntimeHelpers? helpers = null)
     {
         var result = new List<ThrowSite>();
         var targets = map.Functions.Where(f => f.Import == "__cxa_throw").Select(f => f.Start).ToHashSet();
@@ -109,7 +109,7 @@ public static class ExceptionFacts
         // Raise/Rethrow 也有只含一次调用的导出/包装；顺着唯一调用走到真正抛出点。
         // 多调用函数不任意选一条路，仍由全映像逐点普查报告其所有直接 __cxa_throw。
         var paths = new HashSet<ulong>();
-        var roots = helpers.Helpers.Values.Where(h => h.Kind is HelperKind.Raise or HelperKind.Rethrow or HelperKind.Throw).Select(h => h.Address).ToList();
+        var roots = (helpers?.Helpers.Values ?? []).Where(h => h.Kind is HelperKind.Raise or HelperKind.Rethrow or HelperKind.Throw).Select(h => h.Address).ToList();
         if (map.Image.Exports.TryGetValue("il2cpp_raise_exception", out var raise)) roots.Add(raise);
         foreach (var root in roots)
         {
@@ -142,7 +142,7 @@ public static class ExceptionFacts
                 if (sites.Contains(pc))
                 {
                     var typeInfo = registers[1] ?? AcrossBlocks(map, function, pc);
-                    result.Add(new(function.Start, pc, function.Region, helpers.At(function.Start) is not null,
+                    result.Add(new(function.Start, pc, function.Region, helpers?.At(function.Start) is not null,
                         paths.Contains(function.Start), typeInfo, registers[2], typeInfo is { } type ? TypeName(map.Image, type) : null)
                     { ByConstant = byConstant });
                 }

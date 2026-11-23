@@ -36,9 +36,11 @@ public static class RuntimeLayout
         ClassGenericRecursionDepth = 0x121, ClassRank = 0x122, ClassMinimumAlignment = 0x123, ClassNaturalAlignment = 0x124, ClassPackingSize = 0x125,
         /// <summary>位域首字节：bit0 initialized_and_no_error，bit1 initialized，bit2 enumtype，bit3 nullabletype，bit4 is_generic，bit5 has_references，bit6 init_pending，bit7 size_init_pending。</summary>
         ClassBitflags1 = 0x126,
-        /// <summary>位域次字节：bit0 enumtype，bit1 size_init_pending（置位表示类布局还待初始化），其余位的位序未逐位核对。</summary>
+        /// <summary>位域次字节：bit1 has_cctor（有静态构造），由静态构造查找与调用路径核验；其余位的位序未逐位核对。</summary>
         ClassBitflags2 = 0x127,
         ClassVtable = 0x128;
+    public const byte ClassHasCctorMask = 0x02;
+
     /// <summary>VirtualInvokeData { methodPtr; method }。</summary>
     public const int VirtualInvokeDataSize = 0x10, VirtualInvokeDataMethod = 0x08;
     /// <summary>Il2CppRuntimeInterfaceOffsetPair { interfaceType; offset }。</summary>

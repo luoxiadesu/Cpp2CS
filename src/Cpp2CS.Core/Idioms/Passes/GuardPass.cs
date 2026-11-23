@@ -15,32 +15,16 @@ internal static class GuardPass
         var helpers = calls.Select(c => state.owner.HelperOf(c)?.Kind).ToList();
         var condition = state.defs.Expand(branch.Condition);
         var loads = TopLoadsPass.TopLoads(condition).Distinct().ToList();
-        // 类布局守卫可以是两个字段的合取：未初始化（size_inited 为 0）且没有静态构造在跑（cctor_finished 为 0）。
-        // 其余情况只有一个守卫字段。
+        // 静态构造守卫可由 has_cctor 与 cctor_finished 两个字段合取。
         if (loads.Count is not (1 or 2))
             return false;
         var load = loads[0];
-        // 守卫字段一起代入：全 0（都不待初始化）时走跳过一侧；待初始化的字段置位时走初始化一侧。
-        // 「置位」取该读取宽度内的全 1：位测试只关心对应位非零，与具体掩码等价。
         Expr Assign(ulong[] values) =>
             Fold.Simplify(ExprMap.Map(condition, e => e is Load hit && loads.IndexOf(hit) is var index and >= 0
                 ? Expr.C(values[index], hit.Width) : null));
-        bool Decides(ulong enter, ulong skip)
-        {
-            if (enter != 0 || skip == 0) return false;
-            // 全 0 走跳过一侧；至少有一个字段的置位组合走初始化一侧（合取条件里它是必需的那个字段）。
-            var initial = DirectionPass.Direction(Assign(new ulong[loads.Count]), e => e);
-            if (initial is null) return false;
-            var triggering = 0;
-            for (var i = 0; i < loads.Count; i++)
-            {
-                var values = new ulong[loads.Count];
-                values[i] = ulong.MaxValue;
-                if (DirectionPass.Direction(Assign(values), e => e) is not { } direction) return false;
-                if (direction != initial) triggering++;
-            }
-            return triggering == 1;
-        }
+        bool Decides(ulong enter, ulong skip) => loads.Count == 1
+            && DirectionPass.Direction(Assign([enter]), e => e) == side
+            && DirectionPass.Direction(Assign([skip]), e => e) == 1 - side;
         // s_Il2CppMethodInitialized：读 1 字节守卫，区域内只有 InitMetadata(槽位)、置位写入与纯定义。
         // 纯定义包括跨调用保存恢复的寄存器（如按低位保存的实参），只经合并点的 φ 流出，由 Merge 检查两侧相同。
         if (helpers.All(k => k == HelperKind.InitMetadata))
@@ -93,29 +77,33 @@ internal static class GuardPass
         Expr Field(int offset) => Fold.Simplify(new Binary(BinOp.Add, subject, Expr.C((ulong)offset, 64), 64));
         var (kind, template, enter, skip, offsets, width, returnsArgument) = helpers[0] switch
         {
-            HelperKind.ClassInit => (OpKind.RunClassConstructor, Template.ClassConstructorGuard, 0UL, 1UL, (int[])[RuntimeLayout.ClassCctorFinishedOrNoCctor], 32, false),
-            // 类布局守卫：位测试可以落在 bitflags1 或 bitflags2；两字段合取时另一个字段是 cctor_finished。
-            HelperKind.InitializedTypeInfo => (OpKind.InitClass, Template.InitClassGuard, 0UL, 1UL,
-                (int[])[RuntimeLayout.ClassBitflags1, RuntimeLayout.ClassBitflags2, RuntimeLayout.ClassCctorFinishedOrNoCctor], 8, true),
+            HelperKind.ClassInit => (OpKind.RunClassConstructor, Template.ClassConstructorGuard, 0UL, 1UL,
+                (int[])[RuntimeLayout.ClassCctorFinishedOrNoCctor, RuntimeLayout.ClassBitflags2, RuntimeLayout.ClassBitflags1], 32, false),
+            HelperKind.InitializedTypeInfo => (OpKind.InitClass, Template.InitClassGuard, 0UL, ulong.MaxValue,
+                (int[])[RuntimeLayout.ClassBitflags1], 8, true),
             HelperKind.InitMethodRgctx => (OpKind.InitMethodRgctx, Template.MethodRgctxGuard, 0UL, 0x1000UL, (int[])[RuntimeLayout.MethodRgctxData], 64, true),
             _ => (default, default, 0UL, 0UL, (int[])[], 0, false),
         };
         var offset = offsets.FirstOrDefault(o => load.Address == Field(o), -1);
-        if (width == 0 || offset < 0 || !Decides(enter, skip))
+        if (width == 0 || offset < 0)
             return false;
-        if (kind == OpKind.InitClass)
+        if (kind == OpKind.RunClassConstructor && loads.Count == 2)
         {
-            // 每个 load 都必须是对应字段上的位测试或 32 位的 cctor 判断；位测试至少有一个。
-            var bits = 0;
-            foreach (var candidate in loads)
-            {
-                if (candidate.Width == 32 && candidate.Address == Field(RuntimeLayout.ClassCctorFinishedOrNoCctor)) continue;
-                if (!ClassInitializationFlags.IsBitTest(condition, candidate)) return false;
-                bits++;
-            }
-            if (bits == 0) return false;
+            var flags = loads.SingleOrDefault(l => l.Width == 8 && l.Address == Field(RuntimeLayout.ClassBitflags2)
+                || l.Width == 16 && l.Address == Field(RuntimeLayout.ClassBitflags1));
+            var finished = loads.SingleOrDefault(l => l.Width == 32 && l.Address == Field(RuntimeLayout.ClassCctorFinishedOrNoCctor));
+            var hasMask = (ulong)RuntimeLayout.ClassHasCctorMask << (flags?.Width == 16 ? 8 : 0);
+            if (flags is null || finished is null || !ClassInitializationFlags.UsesOnlyMask(condition, flags, hasMask)) return false;
+            foreach (var hasConstructor in new[] { false, true })
+                foreach (var done in new[] { false, true })
+                {
+                    var values = loads.Select(l => l == flags ? (hasConstructor ? hasMask : 0) : (done ? 1UL : 0)).ToArray();
+                    if (DirectionPass.Direction(Assign(values), e => e) != (hasConstructor && !done ? side : 1 - side)) return false;
+                }
         }
-        else if (loads.Count != 1 || load.Width != width)
+        else if (!Decides(enter, skip) || (kind == OpKind.InitClass
+            ? !ClassInitializationFlags.IsBitTest(condition, load)
+            : load.Width != width || offset != offsets[0]))
             return false;
         // 区域内除 helper 调用外只允许纯定义：常量、符号、对守卫字段的重新读取（初始化之后的值）
         if (!statements.All(s => s is Nop or Jump || ReferenceEquals(s, helperCall) || s is Define { Value: Const or Symbol } || s is Define d && loads.Any(l => ClassInitializationFlags.IsReload(state.defs.Expand(d.Value), l))))

@@ -68,7 +68,8 @@ public sealed record RuntimeHelper(ulong Address, HelperKind Kind, string? Detai
 /// 识别托管代码（il2cpp 节）调用的非托管目标。依据只用代码与符号事实，不读调试信息：
 /// 1. PLT 导入名；
 /// 2. il2cpp_* 导出：从导出与候选各自沿“细跳板”（首条为 B，或至多 8 条且只有一次调用的包装）前进，链路相交即同一实现；
-/// 3. 异常：闭包内有函数以 ("System", "XxxException") C 字符串构造异常；若同时到达 Raise 则为 Throw，否则 GetException。
+/// 3. 异常：闭包内有函数以 ("System", "XxxException") C 字符串构造异常；若同时到达 Raise 则为 Throw，能返回时为 GetException。
+///    Raise 可由导出链确定，也可由 __cxa_throw 的 wrapper 实参及入口异常对象的载荷写入证明。
 ///    Throw 还要求函数本身不返回（没有 ret，也不以 B/BR 跳到会返回的函数）：会返回的是条件抛出（判空、越界、类型检查、icall 解析），
 ///    其中只认精确形态 "cbz x0 → 抛出 NRE；ret"（未内联的判空，NullCheck），其余记为 Unknown；
 /// 4. 元数据槽位初始化：闭包内有令牌解码（取位 29–31 的 UBFX/LSR #29）且调用点前紧邻 ADRP+ADD 构造已解码槽位地址。
@@ -123,6 +124,8 @@ public sealed partial class RuntimeHelpers
     {
         var result = new RuntimeHelpers(map, scan);
         result.BuildExportChains();
+        result.wrapperThrows = ExceptionFacts.Throws(map, scan)
+            .Where(s => s.Name == ExceptionFacts.WrapperName && s.Destructor == 0).ToLookup(s => s.Entry);
         result.interfaceSlowPath = result.InterfaceSlowPath();
         foreach (var (target, count) in targets)
             result.helpers[target] = result.Classify(target, count, slotAddressesBeforeCall.GetValueOrDefault(target));
@@ -292,6 +295,8 @@ public sealed partial class RuntimeHelpers
         if (interfaceSlowPath is { } slow && chain.Contains(slow))
             return (HelperKind.InterfaceLookup, null, $"il2cpp_object_get_virtual_method 在接口偏移扫描失败后调用 0x{slow:x}");
         var calls = CallsOf(body).ToArray();
+        if (WrapperRaiseBody(body))
+            return (HelperKind.Raise, null, "向 __cxa_throw 传入已核验 RTTI 与空析构器的 Il2CppExceptionWrapper，载荷为入口 x0，函数不返回");
         if (ExecutingAssemblyBody(target))
             return (HelperKind.ExecutingAssembly, null,
                 $"读取 MethodInfo+0x{RuntimeLayout.MethodKlass:x} klass、Il2CppClass+0x{RuntimeLayout.ClassImage:x} image、Il2CppImage+0x{RuntimeLayout.ImageAssembly:x} assembly 后尾调用取反射对象");
@@ -327,13 +332,12 @@ public sealed partial class RuntimeHelpers
                 return (HelperKind.InitMethodRgctx, null,
                     $"调用 0x{wrapperCalls[0]:x}（读取 MethodInfo+0x{RuntimeLayout.MethodRgctxData:x} rgctx_data 与 +0x{RuntimeLayout.MethodGenericMethod:x} genericMethod）后返回原 MethodInfo");
         }
-        // Class::Init 本体：读 +0x127 的 size_inited 提前返回，否则在 +0xD8 的 cctor_finished_or_no_cctor 与
-        // +0xD4 的 cctor_started 上做原子比较交换。与带包装的 InitializedTypeInfo 是同一语义，只是调用点直接进入本体。
+        // Runtime::ClassInit：没有静态构造时返回；否则在 cctor_finished 与 cctor_started 上同步，查找并调用 .cctor。
         // 这两个字段经 add 基址 + 原子访问（ldaxr/stlxr）读写，不走普通偏移访存，因此按“基址位移出现 + 原子访问”判定。
         if (LoadsOffset(body, RuntimeLayout.ClassBitflags2, WholeFunction) && HasAtomic(body)
             && Displaces(body, RuntimeLayout.ClassCctorFinishedOrNoCctor) && Displaces(body, RuntimeLayout.ClassCctorStarted))
-            return (HelperKind.InitializedTypeInfo, null,
-                $"函数体内读 Il2CppClass+0x{RuntimeLayout.ClassBitflags2:x} size_inited，并在 +0x{RuntimeLayout.ClassCctorFinishedOrNoCctor:x} cctor_finished 与 " +
+            return (HelperKind.ClassInit, null,
+                $"函数体内读 Il2CppClass+0x{RuntimeLayout.ClassBitflags2:x} has_cctor，并在 +0x{RuntimeLayout.ClassCctorFinishedOrNoCctor:x} cctor_finished 与 " +
                 $"+0x{RuntimeLayout.ClassCctorStarted:x} cctor_started 上做原子比较交换");
         // v24 的全局元数据初始化：按参数下标的用途表项（Il2CppMetadataUsagePair：slot, encoded），
         // encoded >> 29 取种类后分派初始化，最后写入槽位。特征是指令流里有 uxtw #3 的索引寻址、lsr #29 的种类解码。
@@ -348,11 +352,11 @@ public sealed partial class RuntimeHelpers
             return (HelperKind.ArrayElementAddress, null, $"读取 Il2CppClass+0x{RuntimeLayout.ClassElementSize:x} element_size，并加数组头 0x{RuntimeLayout.ArrayData:x}");
         if (words.Length <= 10 && LoadsOffset(body, RuntimeLayout.FieldParent, 4) && LoadsOffset(body, RuntimeLayout.FieldOffset, 4) && calls.Length == 0)
             return (HelperKind.FieldAddress, null, $"读取 FieldInfo+0x{RuntimeLayout.FieldOffset:x} offset 加到对象地址（值类型扣除对象头）");
-        // Object::New：读 instance_size 分配存储、把 klass 写到对象头，末尾调用 Class::Init 保证布局已初始化，返回对象。
-        // 类初始化本体在静态链接后没有符号，这里按它自身的结构指纹（见 ClassLayoutInitBody）认定，不依赖递归分类。
-        if (LoadsOffset(body, RuntimeLayout.ClassInstanceSize, WholeFunction) && calls.Any(c => ClassLayoutInitBody(Terminal(c))))
+        // Object::New：读 instance_size 分配存储、把 klass 写到对象头，返回前调用 Runtime::ClassInit 运行静态构造，返回对象。
+        // 类初始化本体在静态链接后没有符号，这里按它自身的结构指纹（见 ClassConstructorBody）认定，不依赖递归分类。
+        if (LoadsOffset(body, RuntimeLayout.ClassInstanceSize, WholeFunction) && calls.Any(c => ClassConstructorBody(Terminal(c))))
             return (HelperKind.ObjectNew, null,
-                $"读取 Il2CppClass+0x{RuntimeLayout.ClassInstanceSize:x} instance_size 分配对象，并在返回前调用 Class::Init 完成布局初始化");
+                $"读取 Il2CppClass+0x{RuntimeLayout.ClassInstanceSize:x} instance_size 分配对象，并在返回前调用 Runtime::ClassInit 运行静态构造");
         // Array::New：按 element_size 乘长度分配（多出数组头），把长度写到 Il2CppArray+0x18；
         // 长度为负时走抛出路径，判定用长度作有符号数检查最高位（lsr #31 后接条件分支）。
         if (HasSignedLengthCheck(body, Words(body, 48)) && words.Any(w => A64.IsAddImmediate64(w) && A64.AddImmediate(w) == RuntimeLayout.ArrayData))
@@ -373,10 +377,10 @@ public sealed partial class RuntimeHelpers
     }
 
     /// <summary>
-    /// Class::Init 本体的结构指纹：读 +0x127 的 size_init_pending 提前返回，并在 +0xD8 cctor_finished_or_no_cctor
+    /// Runtime::ClassInit 的结构指纹：读 +0x127 的 has_cctor 提前返回，并在 +0xD8 cctor_finished_or_no_cctor
     /// 与 +0xD4 cctor_started 上做原子比较交换。静态链接后没有导出名，只能按函数体认定。
     /// </summary>
-    private bool ClassLayoutInitBody(ulong body) =>
+    private bool ClassConstructorBody(ulong body) =>
         LoadsOffset(body, RuntimeLayout.ClassBitflags2, WholeFunction) && HasAtomic(body)
         && Displaces(body, RuntimeLayout.ClassCctorFinishedOrNoCctor) && Displaces(body, RuntimeLayout.ClassCctorStarted);
 
@@ -447,7 +451,7 @@ public sealed partial class RuntimeHelpers
         var exceptions = function is { Size: <= ExceptionWrapperLimit * 4 } ? closure.Select(ExceptionName).Where(n => n is not null).Distinct().ToArray() : [];
         if (exceptions.Length == 1)
         {
-            var raises = closure.Any(f => exportChains.TryGetValue(f, out var e) && e.Kind == HelperKind.Raise);
+            var raises = closure.Any(f => KindAt(f) == HelperKind.Raise || WrapperRaiseBody(f));
             if (raises && CanReturn(target, 2))
             {
                 var head = Words(target, 2).Select(x => x.Word).ToArray();
@@ -455,10 +459,12 @@ public sealed partial class RuntimeHelpers
                 if (exceptions[0] == "System.NullReferenceException" && head is [var cbz, var ret] && (cbz & 0xFF00001F) == 0xB4000000 && A64.IsRet(ret))
                     return new(target, HelperKind.NullCheck, null, "cbz x0 → 抛出 NullReferenceException，否则 ret（未内联的判空）", calls);
                 return new(target, HelperKind.Unknown, null,
-                    $"闭包内以 C 字符串构造 {exceptions[0]} 并到达 il2cpp_raise_exception，但函数可以返回（条件抛出）", calls);
+                    $"闭包内以 C 字符串构造 {exceptions[0]} 并到达托管异常抛出，但函数可以返回（条件抛出）", calls);
             }
+            if (!raises && !CanReturn(target, 2))
+                return new(target, HelperKind.Unknown, null, "闭包内构造异常，但缺少返回或托管抛出证据", calls);
             return new(target, raises ? HelperKind.Throw : HelperKind.GetException, exceptions[0],
-                $"闭包内以 C 字符串 (\"System\", \"{exceptions[0]![7..]}\") 构造异常{(raises ? "并到达 il2cpp_raise_exception" : "")}", calls);
+                $"闭包内以 C 字符串 (\"System\", \"{exceptions[0]![7..]}\") 构造异常{(raises ? "并到达托管异常抛出" : "")}", calls);
         }
         return new(target, HelperKind.Unknown, null,
             exceptions.Length > 1 ? $"闭包内有多个异常名：{string.Join("、", exceptions)}" : "没有可用证据", calls);
