@@ -99,22 +99,34 @@ public sealed partial class TypeOracle
         };
     }
 
-    /// <summary>类指针所属的对象：引用类型对象偏移 0 处的 64 位读取；对象的类指针不可变，各入边读同一对象的合流仍是它。</summary>
+    /// <summary>类指针所属的对象：引用类型对象偏移 0 处的 64 位读取；对象的类指针不可变，各入边读同一对象的合流仍是它。
+    /// 地址的根经过 φ 环时沿环再入会无限递归，环上的重复项按「不是同一对象」处理。</summary>
     public Sym? ClassOwner(Sym klass)
     {
+        var active = new HashSet<Sym>();
+        return ClassOwner(klass, active);
+    }
+
+    private Sym? ClassOwner(Sym klass, HashSet<Sym> active)
+    {
         klass = SymTable.Resolve(klass);
-        if (klass is PhiSym { Projection: null } phi)
+        if (!active.Add(klass)) return null;
+        try
         {
-            Sym? owner = null;
-            foreach (var source in phi.Sources)
+            if (klass is PhiSym { Projection: null } phi)
             {
-                if (source is null || SymTable.Resolve(source) is not ReadSym read || ClassOwner(read) is not { } root || owner is not null && !ReferenceEquals(owner, root)) return null;
-                owner = root;
+                Sym? owner = null;
+                foreach (var source in phi.Sources)
+                {
+                    if (source is null || SymTable.Resolve(source) is not ReadSym read || ClassOwner(read, active) is not { } root || owner is not null && !ReferenceEquals(owner, root)) return null;
+                    owner = root;
+                }
+                return owner;
             }
-            return owner;
+            return klass is ReadSym { Width: 64 } direct && Decompose(direct.Address) is (var address, 0, null, _)
+                && TypeOf(address) is { } type && ManagedTypes.IsReferenceType(type) ? address : null;
         }
-        return klass is ReadSym { Width: 64 } direct && Decompose(direct.Address) is (var address, 0, null, _)
-            && TypeOf(address) is { } type && ManagedTypes.IsReferenceType(type) ? address : null;
+        finally { active.Remove(klass); }
     }
 
     /// <summary>

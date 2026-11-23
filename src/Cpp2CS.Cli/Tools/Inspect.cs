@@ -14,20 +14,23 @@ internal static class Inspect
     {
         string? cache = null;
         var targets = new List<string>();
+        var infer = true;
         for (var i = 0; i < options.Length; i++)
         {
             if (options[i] == "--fact-cache-file" && i + 1 < options.Length) cache = Path.GetFullPath(options[++i]);
+            else if (options[i] == "--no-infer") infer = false;
             else if (options[i] is "--brief" or "--calls" or "--inline") continue;
             else targets.Add(options[i]);
         }
-        var facts = FactsBuilder.Build(binary, metadata, options: new Cpp2CS.Options.RecoveryOptions { FactCacheFile = cache });
+        var facts = FactsBuilder.Build(binary, metadata, options: new Cpp2CS.Options.RecoveryOptions { FactCacheFile = cache }, inferUnregistered: infer);
         var types = new ManagedTypes(facts.Model, facts.Layouts);
         var decompiler = new MethodDecompiler(facts, types);
         foreach (var target in Targets(facts, types, targets))
         {
             Console.Write($"== 0x{target.Entry:x} {target.Instance}");
             var method = target.Shared ? decompiler.BindShared(target.Instance, target.Entry) : target.Instance;
-            if (!decompiler.Analyze(method, target.Entry).TryGet(out var analysis, out var failure))
+            var analyzed = decompiler.Analyze(method, target.Entry);
+            if (!analyzed.TryGet(out var analysis, out var failure))
             {
                 Console.WriteLine($"\n  ! 0x{failure.Address:x} {failure.Reason}");
                 continue;

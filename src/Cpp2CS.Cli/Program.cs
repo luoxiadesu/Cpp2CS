@@ -18,7 +18,7 @@ internal static class Program
         Console.OutputEncoding = System.Text.Encoding.UTF8;
         return args switch
         {
-            ["facts", var binary, var metadata, var output] => Facts(binary, metadata, output),
+            ["facts", var binary, var metadata, var output, .. var options] => Facts(binary, metadata, output, options),
             ["refs", var binary, var metadata, var address] => Refs(binary, metadata, Convert.ToUInt64(address, 16)),
             ["layout", var binary, var metadata, var type, .. var options] => Layout(binary, metadata, type, options),
             ["ssa", var binary, var metadata, .. var addresses] when addresses.Length > 0 => Ssa(binary, metadata, Hex(addresses), addresses.Contains("--idioms"), addresses),
@@ -342,9 +342,9 @@ internal static class Program
     }
 
     /// <summary>建立基础事实并写出 summary.json（检查结果、计时）。存在 Error 级违例时返回 1。</summary>
-    private static int Facts(string binary, string metadata, string output)
+    private static int Facts(string binary, string metadata, string output, string[] options)
     {
-        var facts = FactsBuilder.Build(binary, metadata, Console.Error.WriteLine);
+        var facts = FactsBuilder.Build(binary, metadata, Console.Error.WriteLine, options: CacheOptions(options));
         Directory.CreateDirectory(output);
         var summary = new
         {

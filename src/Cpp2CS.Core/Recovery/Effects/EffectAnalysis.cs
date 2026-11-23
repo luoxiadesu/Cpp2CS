@@ -20,6 +20,8 @@ internal sealed class EffectAnalysis(ValueModel values, TypeOracle oracle, IRead
 
     private readonly MachineEffects semantics = new(values, oracle);
     private Dictionary<Block, int>? positions;
+    /// <summary>下降期间方法体不变，非空集合按位置缓存。</summary>
+    private readonly Dictionary<(Block Block, int Index), HashSet<Sym>> nonNullAt = [];
 
     /// <summary>
     /// 边在逆后序上向前：任何环都含一条不向前的边。值的定义支配它的使用，从使用走到定义要经过环，
@@ -68,9 +70,12 @@ internal sealed class EffectAnalysis(ValueModel values, TypeOracle oracle, IRead
     /// <summary>
     /// 在 (block, index) 处已知非空的对象：沿唯一前驱链已执行完的判空、经该对象的读写（未抛出即非空）、分配的结果，
     /// 以及进入这条链的分支条件（与 0 比较的不等一侧）。
+    /// 方法体在下降期间不变，结果按位置缓存；同一条语句上的多次查询（读取本身与判空吸收）复用同一份。
     /// </summary>
     private HashSet<Sym> NonNull(Block block, int index)
     {
+        if (nonNullAt.TryGetValue((block, index), out var cached)) return cached;
+        var key = (block, index);
         var known = new HashSet<Sym>();
         void Executed(Stmt statement)
         {
@@ -96,7 +101,7 @@ internal sealed class EffectAnalysis(ValueModel values, TypeOracle oracle, IRead
             block = from;
             index = block.Statements.Count;
         }
-        return known;
+        return nonNullAt[key] = known;
     }
 
     /// <summary>

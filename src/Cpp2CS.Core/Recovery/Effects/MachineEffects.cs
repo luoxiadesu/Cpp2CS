@@ -8,8 +8,12 @@ namespace Cpp2CS.Recovery.Effects;
 /// <summary>机器语句在托管语义下的效果；地址与类型事实由 TypeOracle 提供。</summary>
 internal sealed class MachineEffects(ValueModel values, TypeOracle oracle)
 {
-    public (EffectSummary Effects, Sym? Root) Read(ReadSym read, IReadOnlySet<Sym> nonNull)
+    /// <summary>与 nonNull 无关的部分（位置、根、类别）；同一读取在判空吸收里会被反复求值，位置查询不便宜。</summary>
+    private readonly Dictionary<ReadSym, (Location? Location, Sym Root, MemoryKind Kind)> readKinds = new(ReferenceEqualityComparer.Instance);
+
+    private (Location? Location, Sym Root, MemoryKind Kind) Classify(ReadSym read)
     {
+        if (readKinds.TryGetValue(read, out var known)) return known;
         var location = oracle.Locate(read.Address, read.Width);
         var (root, offset, index, _) = oracle.Decompose(read.Address);
         root = SymTable.Resolve(root);
@@ -32,6 +36,12 @@ internal sealed class MachineEffects(ValueModel values, TypeOracle oracle)
             _ when header || bounds => MemoryKind.Instance,
             _ => MemoryKind.Unknown,
         };
+        return readKinds[read] = (location, root, kind);
+    }
+
+    public (EffectSummary Effects, Sym? Root) Read(ReadSym read, IReadOnlySet<Sym> nonNull)
+    {
+        var (location, root, kind) = Classify(read);
         // beforefieldinit 类型的初始化可以在首次访问之前的任何时刻发生（ECMA-335 II.10.5.3.2），读取不构成时序约束。
         if (location is { Kind: LocationKind.Static, Owner: DefinitionRef owner } && (owner.Definition.Attributes & System.Reflection.TypeAttributes.BeforeFieldInit) != 0)
             return (new(EffectKind.Read), root);
@@ -50,17 +60,53 @@ internal sealed class MachineEffects(ValueModel values, TypeOracle oracle)
     {
         var effect = Operation(statement);
         foreach (var read in values.ReadsAt(statement)) effect |= Read(read, nonNull).Effects;
-        foreach (var value in values.Operands(statement)) effect |= Computation(value);
+        // 共享子节点只展开一次：符号图可以很大，逐操作数独立递归会重复展开同一子树。
+        var seen = new HashSet<Sym>();
+        foreach (var value in values.Operands(statement)) effect |= Computation(value, seen);
         return effect;
     }
 
-    private static EffectSummary Computation(Sym value) => SymTable.Resolve(value) switch
+    /// <summary>运算是否可能在计算时抛出其他异常。符号图节点在大方法上可达数千，结果按节点缓存。</summary>
+    private EffectSummary Computation(Sym value, HashSet<Sym> seen)
     {
-        UnknownSym or UndefSym => EffectSummary.Unknown,
-        OpSym op => op.Args.Aggregate(op.Op.Kind == OperatorKind.Binary && op.Op.Binary is BinOp.SDiv or BinOp.UDiv or BinOp.SRem or BinOp.URem
-            ? new EffectSummary(EffectKind.None, ExceptionEffect.Other) : EffectSummary.None, (effect, arg) => effect | Computation(arg)),
-        SliceSym slice => Computation(slice.Base),
-        ConcatSym concat => concat.Parts.Aggregate(EffectSummary.None, (effect, part) => effect | Computation(part)),
-        _ => EffectSummary.None,
-    };
+        var (effect, _) = Compute(value, seen);
+        return effect;
+    }
+
+    /// <summary>返回效果与子树是否含环；含环的结果依赖展开路径，不能缓存。</summary>
+    private (EffectSummary Effect, bool Cyclic) Compute(Sym value, HashSet<Sym> seen)
+    {
+        value = SymTable.Resolve(value);
+        if (computations.TryGetValue(value, out var known)) return (known, false);
+        if (!seen.Add(value)) return (EffectSummary.None, true);
+        (EffectSummary Effect, bool Cyclic) result = value switch
+        {
+            UnknownSym or UndefSym => (EffectSummary.Unknown, false),
+            OpSym op => Combine(op.Args, op.Op.Kind == OperatorKind.Binary && op.Op.Binary is BinOp.SDiv or BinOp.UDiv or BinOp.SRem or BinOp.URem
+                ? new EffectSummary(EffectKind.None, ExceptionEffect.Other) : EffectSummary.None, seen),
+            SliceSym slice => Compute(slice.Base, seen),
+            ConcatSym concat => Combine(concat.Parts, EffectSummary.None, seen),
+            _ => (EffectSummary.None, false),
+        };
+        seen.Remove(value);
+        if (!result.Cyclic) computations[value] = result.Effect;
+        return result;
+    }
+
+    /// <summary>多个子值的效果取并；任一子值含环则整棵子树不缓存。</summary>
+    private (EffectSummary Effect, bool Cyclic) Combine(IEnumerable<Sym> args, EffectSummary seed, HashSet<Sym> seen)
+    {
+        var effect = seed;
+        var cyclic = false;
+        foreach (var arg in args)
+        {
+            var (part, cycle) = Compute(arg, seen);
+            effect |= part;
+            cyclic |= cycle;
+        }
+        return (effect, cyclic);
+    }
+
+    /// <summary>节点效果与语句无关，可在方法的整个下降期间复用。</summary>
+    private readonly Dictionary<Sym, EffectSummary> computations = new(ReferenceEqualityComparer.Instance);
 }
