@@ -26,6 +26,7 @@ internal sealed class Assertions
 {
     private int failures;
     private int passes;
+    private int skipped;
 
     public void True(bool condition, string message)
     {
@@ -37,9 +38,13 @@ internal sealed class Assertions
     public void Equal<T>(T expected, T actual, string message) =>
         True(EqualityComparer<T>.Default.Equals(expected, actual), $"{message}：期望 {expected}，实际 {actual}");
 
+    /// <summary>输入缺少前提，检查不成立；跳过不计入通过，但也不判失败。</summary>
+    public void Skip(string message) { skipped++; Console.WriteLine($"- 跳过 {message}"); }
+
     public int Finish(string name)
     {
-        Console.WriteLine(failures == 0 ? $"✓ {name}：{passes} 项通过" : $"✗ {name}：{failures} 项失败，{passes} 项通过");
+        var tail = skipped == 0 ? "" : $"，{skipped} 项跳过";
+        Console.WriteLine(failures == 0 ? $"✓ {name}：{passes} 项通过{tail}" : $"✗ {name}：{failures} 项失败，{passes} 项通过{tail}");
         return failures == 0 ? 0 : 1;
     }
 }

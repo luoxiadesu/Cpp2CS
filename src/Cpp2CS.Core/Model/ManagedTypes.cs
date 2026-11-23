@@ -13,13 +13,15 @@ public sealed record FieldAccess(FieldRef Field, TypeRef Type);
 /// </summary>
 public sealed partial class ManagedTypes
 {
-    private readonly Dictionary<string, TypeDef> corlib = new();
+    // 键带泛型元数：FullName 去掉元数据名的 `N 后缀，Action 与 Action`1 会得到同一个名字。
+    private readonly Dictionary<(string Name, int Arity), TypeDef> corlib = new();
 
     public ManagedTypes(ProgramModel model, ITypeLayouts layouts)
     {
         Model = model;
         Layouts = layouts;
-        foreach (var type in model.Types.Where(t => t.Assembly == "mscorlib.dll" && t.DeclaringType is null)) corlib.TryAdd(type.FullName, type);
+        foreach (var type in model.Types.Where(t => t.Assembly == "mscorlib.dll" && t.DeclaringType is null))
+            corlib.TryAdd((type.FullName, type.GenericParameters.Count), type);
         Object = Corlib("System.Object");
         String = Corlib("System.String");
         Boolean = Corlib("System.Boolean");
@@ -61,8 +63,9 @@ public sealed partial class ManagedTypes
     public DefinitionRef RuntimeFieldHandle { get; }
     public DefinitionRef RuntimeMethodHandle { get; }
 
-    public DefinitionRef Corlib(string fullName) => new(corlib[fullName], []);
-    public TypeDef? CorlibDefinition(string fullName) => corlib.GetValueOrDefault(fullName);
+    /// <summary>按全名取非泛型的核心库类型（元数 0）；Action`1 之类的泛型定义不在此列。</summary>
+    public DefinitionRef Corlib(string fullName) => new(corlib[(fullName, 0)], []);
+    public TypeDef? CorlibDefinition(string fullName) => corlib.GetValueOrDefault((fullName, 0));
 
     /// <summary>IL2CPP 共享实参：引用归为 object，枚举归为同底层类型的共享枚举，值类型实参递归处理。</summary>
     public TypeRef SharedGenericArgument(TypeRef type) => IsReferenceType(type) ? Object : type switch

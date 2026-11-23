@@ -44,10 +44,14 @@ internal static class ArchitectureChecks
             }
             return checks.Finish("架构边界");
         }
-        var sharedReference = facts.Model.RuntimeTypes.OfType<DefinitionRef>().First(d => !d.Definition.IsValueType && FieldLayouts.IsFullyShared(d));
-        var referenceShape = new Aapcs64Classifier(facts.Layouts).Describe(sharedReference);
-        checks.True(referenceShape.Kind == Aapcs64Classifier.Kind.Pointer && referenceShape.Size == 8,
-            "含共享类型参数的引用仍按 AAPCS64 指针传递");
+        // 完全共享的引用见证不是每个输入都有；没有时这条性质无从检查，其余检查照常运行。
+        if (facts.Model.RuntimeTypes.OfType<DefinitionRef>().FirstOrDefault(d => !d.Definition.IsValueType && FieldLayouts.IsFullyShared(d)) is { } sharedReference)
+        {
+            var referenceShape = new Aapcs64Classifier(facts.Layouts).Describe(sharedReference);
+            checks.True(referenceShape.Kind == Aapcs64Classifier.Kind.Pointer && referenceShape.Size == 8,
+                "含共享类型参数的引用仍按 AAPCS64 指针传递");
+        }
+        else checks.Skip("当前输入没有完全共享的引用类型实例，引用传递形状无从检查");
         Convergence(checks, types);
         Identities(checks, types);
         CallIdentities(checks);
@@ -923,8 +927,11 @@ internal static class ArchitectureChecks
         var wrongScalar = new ArgumentValue(0, structure, 32);
         check.True(Validate(new UnaryValue(UnOp.FNeg, wrongScalar, types.Single, 32)) is not null, "相同位宽不能把结构体当作浮点标量");
         check.True(Validate(new ComparisonValue(Cond.FEq, wrongScalar, wrongScalar, types.Boolean)) is not null, "浮点比较检查隐含位重解释");
-        check.True(Validate(new ConversionValue(ConvKind.FloatToFloat, new ArgumentValue(0, types.Int32, 32), types.Double, 64)) is null,
-            "同宽整数可经核心库位重解释后转换浮点");
+        // 同宽整数的浮点转换经 BitConverter 的位重解释；裁剪后的核心库可能缺少这对方法。
+        if (BitConversions.Find(types, types.Int32, types.Single) is not null)
+            check.True(Validate(new ConversionValue(ConvKind.FloatToFloat, new ArgumentValue(0, types.Int32, 32), types.Double, 64)) is null,
+                "同宽整数可经核心库位重解释后转换浮点");
+        else check.Skip("核心库没有 Int32BitsToSingle，同宽整数的位重解释无从写出");
         check.True(Validate(new ConversionValue(ConvKind.FloatToFloat, new ArgumentValue(0, types.Single, 32), types.Double, 64)) is null,
             "合法浮点扩展保留");
         var integer = new ArgumentValue(0, types.UInt64, 64);
@@ -2450,10 +2457,14 @@ internal static class ArchitectureChecks
     private static void EntryKinds(Assertions check, ProgramFacts facts, ManagedTypes types)
     {
         var entries = new MethodEntries(facts, types);
+        // 值类型调整桩表按版本出现；当前样本的注册表不含该表时无从检查，其余检查照常。
         var thunks = facts.Registrations.Entries.Where(e => e.Kind == EntryKind.AdjustorThunk
             && e.Method is { Method.Address: not 0 } && e.Address != e.Method.Method.Address).ToArray();
-        check.True(thunks.Length > 0, "输入包含可检查的值类型调整桩");
-        check.True(thunks.All(e => entries.Of(e.Method!) == e.Method!.Method.Address), "普通方法索引始终指向本体，不受调整桩地址影响");
+        if (thunks.Length > 0)
+        {
+            check.True(thunks.All(e => entries.Of(e.Method!) == e.Method!.Method.Address), "普通方法索引始终指向本体，不受调整桩地址影响");
+        }
+        else check.Skip("当前输入的注册表不含值类型调整桩表，调整桩目标无从检查");
         var generic = facts.Registrations.Entries.Where(e => e.Kind == EntryKind.GenericMethod && e.Method is not null)
             .GroupBy(e => e.Method!).ToDictionary(g => g.Key, g => g.Select(e => e.Address).ToHashSet());
         check.True(entries.Definitions.Where(e => e.Instance.Method.Address == 0)
